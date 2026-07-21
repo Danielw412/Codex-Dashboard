@@ -11,16 +11,19 @@ import {
 import {
   getAccountDailyUsage,
   getLocalDailyUsage,
+  getModelUsageSummaries,
   getRateLimitHistory,
   getThreadSummaries,
   getTokenTotals,
   insertRateLimitSnapshot,
-  upsertAccountDailyUsage
+  upsertAccountDailyUsage,
+  upsertThreadMetadata
 } from './db.js';
 import {
   buildChartPoints,
   calculateModelEfficiency,
-  calculateProjection
+  calculateProjection,
+  calculateThreadUsageEstimates
 } from './analytics.js';
 import { demoOverview } from './demo.js';
 import { loadPricingConfig } from './pricing.js';
@@ -35,6 +38,7 @@ const demoMode = process.env.DEMO_MODE === 'true';
 const rateLimitPollMs = Number(process.env.RATE_LIMIT_POLL_MS || 60_000);
 const accountUsagePollMs = Number(process.env.ACCOUNT_USAGE_POLL_MS || 900_000);
 const sessionScanMs = Number(process.env.SESSION_SCAN_MS || 120_000);
+const threadMetadataPollMs = Number(process.env.THREAD_METADATA_POLL_MS || 900_000);
 
 const codex = new AppServerClient();
 let limits: RateLimitWindow[] = [];
@@ -45,11 +49,39 @@ let accountState: { authType: string | null; planType: string | null } = {
 let connectionError: string | null = null;
 let refreshInProgress: Promise<void> | null = null;
 let lastAccountUsageRefresh = 0;
+let lastThreadMetadataRefresh = 0;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseTime(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.round(value > 10_000_000_000 ? value / 1000 : value);
+  }
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return Math.round(parsed / 1000);
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+function firstText(record: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
 
 codex.on('diagnostic', (message: string) => {
   if (process.env.DEBUG_CODEX_DASHBOARD === 'true') console.log(`[codex] ${message}`);
 });
 codex.on('account/rateLimits/updated', () => {
+  setTimeout(() => void refreshCodexData(false), 500);
+});
+codex.on('thread/name/updated', () => {
+  lastThreadMetadataRefresh = 0;
   setTimeout(() => void refreshCodexData(false), 500);
 });
 
@@ -58,6 +90,46 @@ function pickWindow(duration: number): RateLimitWindow | null {
     limits.find((limit) => Math.abs(limit.windowDurationMins - duration) <= (duration < 1000 ? 5 : 60)) ??
     null
   );
+}
+
+async function refreshThreadMetadata(): Promise<void> {
+  const collected: Array<{
+    threadId: string;
+    displayName: string | null;
+    preview: string | null;
+    updatedAt: number;
+  }> = [];
+
+  for (const archived of [false, true]) {
+    let cursor: string | null = null;
+    for (let page = 0; page < 20; page += 1) {
+      const result = await codex.request('thread/list', {
+        cursor,
+        limit: 100,
+        archived,
+        sortKey: 'updated_at',
+        sortDirection: 'desc'
+      }, 30_000);
+      if (!isRecord(result)) break;
+      const data = Array.isArray(result.data) ? result.data : [];
+      for (const value of data) {
+        if (!isRecord(value)) continue;
+        const threadId = firstText(value, ['id', 'threadId', 'thread_id']);
+        if (!threadId) continue;
+        collected.push({
+          threadId,
+          displayName: firstText(value, ['name', 'title', 'threadName', 'displayName']),
+          preview: firstText(value, ['preview', 'promptPreview']),
+          updatedAt: parseTime(value.updatedAt ?? value.updated_at ?? value.recencyAt ?? value.createdAt)
+        });
+      }
+      cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null;
+      if (!cursor) break;
+    }
+  }
+
+  if (collected.length > 0) upsertThreadMetadata(collected);
+  lastThreadMetadataRefresh = Date.now();
 }
 
 async function refreshCodexData(forceAccountUsage = false): Promise<void> {
@@ -86,8 +158,16 @@ async function refreshCodexData(forceAccountUsage = false): Promise<void> {
           if (daily.length > 0) upsertAccountDailyUsage(daily);
           lastAccountUsageRefresh = now;
         } catch (error) {
-          // Token-activity summaries are not available for every auth mode/account.
           console.warn('Account usage summary unavailable:', (error as Error).message);
+        }
+      }
+
+      if (forceAccountUsage || now - lastThreadMetadataRefresh >= threadMetadataPollMs) {
+        try {
+          await refreshThreadMetadata();
+        } catch (error) {
+          console.warn('Thread titles unavailable from App Server:', (error as Error).message);
+          lastThreadMetadataRefresh = now;
         }
       }
     } catch (error) {
@@ -116,13 +196,22 @@ function buildOverview(): DashboardOverview {
   const sevenDay = pickWindow(10_080);
   const fiveHistory = fiveHour
     ? getRateLimitHistory(300, fiveHour.resetsAt, 2)
-    : getRateLimitHistory(300, undefined, 1);
+    : getRateLimitHistory(300, undefined, 8);
   const sevenHistory = sevenDay
     ? getRateLimitHistory(10_080, sevenDay.resetsAt, 8)
-    : getRateLimitHistory(10_080, undefined, 8);
+    : getRateLimitHistory(10_080, undefined, 15);
   const fiveProjection = calculateProjection(fiveHour, fiveHistory);
   const sevenProjection = calculateProjection(sevenDay, sevenHistory);
-  const threads = getThreadSummaries(100);
+  const usageEstimates = calculateThreadUsageEstimates();
+  const threads = getThreadSummaries(100).map((thread) => {
+    const usage = usageEstimates.get(thread.threadId);
+    return {
+      ...thread,
+      estimatedFiveHourUsagePercent: usage?.fiveHourPercent ?? null,
+      estimatedSevenDayUsagePercent: usage?.sevenDayPercent ?? null,
+      usageSampleIntervals: usage?.sampleIntervals ?? 0
+    };
+  });
   const totals = getTokenTotals();
   const notices: string[] = [];
 
@@ -139,15 +228,18 @@ function buildOverview(): DashboardOverview {
   }
   if (totals.unknownPriceThreads > 0) {
     notices.push(
-      `${totals.unknownPriceThreads} thread(s) use a model that is not in config/pricing.json, so their cost is not included.`
+      `${totals.unknownPriceThreads} thread(s) include a model that is not in config/pricing.json, so part of their cost may be unavailable.`
     );
   }
   if (connectionError) notices.push(`Codex account connection error: ${connectionError}`);
   notices.push(
-    'API-equivalent cost is an estimate based on public API token prices; it is not your ChatGPT subscription charge.'
+    'Thread quota usage is estimated by attributing observed quota changes to local token events in the same time interval. It is not exact billing telemetry.'
   );
   notices.push(
-    'Per-model minutes per 1% is estimated by correlating quota changes with local token events. It becomes more reliable after the dashboard has collected several samples.'
+    'Prompt duration is exact when Codex reports a completed turn. Steering messages inside one turn use the time until the next prompt or turn completion.'
+  );
+  notices.push(
+    'API-equivalent cost is an estimate based on public API token prices; it is not your ChatGPT subscription charge.'
   );
 
   return {
@@ -180,6 +272,7 @@ function buildOverview(): DashboardOverview {
     totals,
     threads,
     modelEfficiency: calculateModelEfficiency(),
+    modelUsage: getModelUsageSummaries(),
     notices
   };
 }
@@ -202,6 +295,7 @@ app.get('/api/pricing', (_request, response) => {
 });
 
 app.post('/api/refresh', async (_request, response) => {
+  lastThreadMetadataRefresh = 0;
   await Promise.all([refreshCodexData(true), refreshSessions()]);
   response.json(buildOverview());
 });
