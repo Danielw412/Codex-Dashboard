@@ -1,8 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline from 'node:readline';
+import { readLocalThreadMetadata } from './localThreadMetadata.js';
 
 interface PendingRequest {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
@@ -16,12 +18,26 @@ interface RpcMessage {
   error?: { code?: number; message?: string; data?: unknown };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function firstString(record: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
 export class AppServerClient extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
   private starting: Promise<void> | null = null;
   private lastError: string | null = null;
+  private localTitleCache = new Map<string, string>();
+  private localTitleCacheAt = 0;
 
   get connected(): boolean {
     return this.process !== null && !this.process.killed;
@@ -109,7 +125,7 @@ export class AppServerClient extends EventEmitter {
         reject(new Error(`Timed out waiting for ${method}`));
       }, timeoutMs);
 
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
       this.process?.stdin.write(`${JSON.stringify(message)}\n`);
     });
   }
@@ -124,6 +140,36 @@ export class AppServerClient extends EventEmitter {
   stop(): void {
     this.process?.kill();
     this.process = null;
+  }
+
+  private getLocalThreadTitles(): Map<string, string> {
+    const now = Date.now();
+    if (now - this.localTitleCacheAt < 5_000) return this.localTitleCache;
+
+    this.localTitleCache = new Map(
+      readLocalThreadMetadata().flatMap((item) =>
+        item.displayName ? [[item.threadId, item.displayName] as const] : []
+      )
+    );
+    this.localTitleCacheAt = now;
+    return this.localTitleCache;
+  }
+
+  private enrichThreadListResult(result: unknown): unknown {
+    if (!isRecord(result) || !Array.isArray(result.data)) return result;
+    const localTitles = this.getLocalThreadTitles();
+    if (localTitles.size === 0) return result;
+
+    return {
+      ...result,
+      data: result.data.map((value) => {
+        if (!isRecord(value)) return value;
+        const threadId = firstString(value, ['id', 'threadId', 'thread_id']);
+        const localTitle = threadId ? localTitles.get(threadId) : null;
+        if (!localTitle || firstString(value, ['name', 'threadName', 'displayName'])) return value;
+        return { ...value, title: localTitle };
+      })
+    };
   }
 
   private handleLine(line: string): void {
@@ -143,7 +189,11 @@ export class AppServerClient extends EventEmitter {
       if (message.error) {
         pending.reject(new Error(message.error.message ?? 'Unknown Codex RPC error'));
       } else {
-        pending.resolve(message.result);
+        pending.resolve(
+          pending.method === 'thread/list'
+            ? this.enrichThreadListResult(message.result)
+            : message.result
+        );
       }
       return;
     }
