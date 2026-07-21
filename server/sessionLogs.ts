@@ -9,7 +9,7 @@ import {
   type StoredThreadEvent
 } from './db.js';
 import { estimateUsageCost, findPricing } from './pricing.js';
-import type { ThreadSummary, TokenUsage } from './types.js';
+import type { SessionPartKind, ThreadPartSummary, TokenUsage } from './types.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -67,7 +67,6 @@ function findIncrementalUsage(record: JsonRecord): TokenUsage | null {
   const parsed = usageFrom(direct);
   if (parsed) return parsed;
 
-  // Newer raw-response events can carry one exact request's usage directly.
   if (payload.type === 'raw_response_completed' || payload.type === 'rawResponse/completed') {
     return usageFrom(payload.usage);
   }
@@ -129,14 +128,47 @@ function extractProjectPath(record: JsonRecord): string | null {
   return findString(record, ['cwd', 'working_directory', 'workingDirectory', 'project_path']);
 }
 
-function extractUserMessage(record: JsonRecord): string | null {
-  const type = eventType(record).toLowerCase();
-  if (!type.includes('user') || (!type.includes('message') && !type.includes('input'))) {
+function detectPartKind(record: JsonRecord): SessionPartKind | null {
+  if (String(record.type).toLowerCase() !== 'session_meta') return null;
+  const payload = isRecord(record.payload) ? record.payload : null;
+  if (!payload) return null;
+
+  const threadSource = typeof payload.thread_source === 'string' ? payload.thread_source.toLowerCase() : '';
+  const source = payload.source;
+  const sourceText = JSON.stringify(source ?? '').toLowerCase();
+  if (sourceText.includes('guardian') || sourceText.includes('review')) return 'reviewer';
+  if (threadSource === 'subagent' || (isRecord(source) && isRecord(source.subagent))) return 'subagent';
+  return 'main';
+}
+
+function extractRawUserMessage(record: JsonRecord): string | null {
+  const payload = isRecord(record.payload) ? record.payload : null;
+  if (!payload) return null;
+
+  // event_msg/user_message is the canonical user-authored entry. Response-item
+  // messages can also contain injected app/plugin context that is not a real prompt.
+  if (record.type === 'event_msg' && payload.type === 'user_message') {
+    return typeof payload.message === 'string' ? payload.message : null;
+  }
+  return null;
+}
+
+function cleanUserMessage(message: string): string | null {
+  let text = message.replace(/\r\n/g, '\n').trim();
+  const requestMarker = /##\s*My request for Codex:\s*/i.exec(text);
+  if (requestMarker) text = text.slice(requestMarker.index + requestMarker[0].length).trim();
+
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+  if (
+    /^the following is the codex agent history/i.test(normalized) ||
+    /^the following is the codex agent transcript/i.test(normalized) ||
+    /^continue the same review conversation/i.test(normalized)
+  ) {
     return null;
   }
-  const text = findString(record, ['message', 'text', 'content', 'input']);
-  if (!text) return null;
-  return text.replace(/\s+/g, ' ').trim().slice(0, 120);
+
+  return normalized.slice(0, 120);
 }
 
 function addUsage(target: TokenUsage, usage: TokenUsage): void {
@@ -174,7 +206,7 @@ async function listJsonlFiles(root: string): Promise<string[]> {
 }
 
 interface ParsedSession {
-  summary: ThreadSummary;
+  summary: ThreadPartSummary;
   events: StoredThreadEvent[];
 }
 
@@ -186,9 +218,12 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
   let title: string | null = null;
   let projectPath: string | null = null;
   let currentModel = 'unknown';
+  let partKind: SessionPartKind = 'main';
   let startedAt: number | null = null;
   let updatedAt: number | null = null;
   let lineNumber = 0;
+  let userMessageCount = 0;
+  const seenUserMessages = new Set<string>();
   const events: StoredThreadEvent[] = [];
   const totals = defaultUsage();
   const modelTokens = new Map<string, number>();
@@ -216,9 +251,26 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
 
     threadId ??= extractThreadId(record);
     projectPath ??= extractProjectPath(record);
-    title ??= extractUserMessage(record);
+    partKind = detectPartKind(record) ?? partKind;
+
+    const rawUserMessage = extractRawUserMessage(record);
+    if (rawUserMessage) {
+      const dedupeKey = rawUserMessage.replace(/\s+/g, ' ').trim();
+      if (!seenUserMessages.has(dedupeKey)) {
+        seenUserMessages.add(dedupeKey);
+        const cleaned = cleanUserMessage(rawUserMessage);
+        if (cleaned) {
+          userMessageCount += 1;
+          title ??= cleaned;
+        }
+      }
+    }
+
     const model = extractModel(record);
-    if (model) currentModel = model;
+    if (model) {
+      currentModel = model;
+      if (model.toLowerCase() === 'codex-auto-review') partKind = 'reviewer';
+    }
 
     const usage = findIncrementalUsage(record);
     if (!usage) continue;
@@ -232,6 +284,7 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
     events.push({
       eventKey,
       threadId: '',
+      sourceFile,
       observedAt,
       model: currentModel,
       ...usage,
@@ -254,13 +307,13 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
   const primaryModel =
     [...modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? currentModel;
   const unknownModels = [...models].filter((model) => findPricing(model) === null);
-  const pricingStatus: ThreadSummary['pricingStatus'] =
+  const pricingStatus: ThreadPartSummary['pricingStatus'] =
     pricedEvents === 0 ? 'unknown' : unknownModels.length > 0 ? 'partial' : 'exact-model-match';
 
   return {
     summary: {
       threadId: finalThreadId,
-      title: title || path.basename(projectPath || sourceFile),
+      title: partKind === 'main' ? title : null,
       projectPath,
       startedAt,
       updatedAt,
@@ -269,7 +322,9 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
       ...totals,
       estimatedApiCostUsd: pricedEvents > 0 ? totalCost : null,
       pricingStatus,
-      sourceFile
+      sourceFile,
+      partKind,
+      userMessageCount: partKind === 'main' ? userMessageCount : 0
     },
     events
   };
