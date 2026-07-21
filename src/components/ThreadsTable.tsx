@@ -190,7 +190,7 @@ function ExpandedThread({ thread }: { thread: ThreadSummary }) {
             <strong>{formatUsage(thread.estimatedSevenDayUsagePercent)}</strong>
           </div>
           <div>
-            <span>Attribution samples</span>
+            <span>Quota-change samples</span>
             <strong>{thread.usageSampleIntervals}</strong>
           </div>
           <div>
@@ -198,7 +198,7 @@ function ExpandedThread({ thread }: { thread: ThreadSummary }) {
             <strong>{thread.partCount}</strong>
           </div>
           <p>
-            Each percentage applies only to the quota bank active at the thread’s latest token event. Missing or inconsistent snapshot coverage is left blank.
+            Usage is the quota difference between the snapshot before the thread and the first reported change after its final token event. Overlapping threads share the change by cost or tokens.
           </p>
         </div>
       </div>
@@ -264,6 +264,13 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
             <tbody>
               {threads.map((thread) => {
                 const isExpanded = expanded.has(thread.threadId);
+                const primaryUsage =
+                  thread.estimatedFiveHourUsagePercent ?? thread.estimatedSevenDayUsagePercent;
+                const primaryUsageLabel = thread.estimatedFiveHourUsagePercent !== null
+                  ? '5-hour bank at last activity'
+                  : thread.estimatedSevenDayUsagePercent !== null
+                    ? '7-day bank at last activity'
+                    : 'No reliable before/after samples';
                 return (
                   <Fragment key={thread.threadId}>
                     <tr className={isExpanded ? 'thread-summary-row expanded' : 'thread-summary-row'}>
@@ -301,17 +308,14 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
                         )}
                       </td>
                       <td className="numeric-cell">
-                        {formatUsage(thread.estimatedSevenDayUsagePercent)}
-                        <span className="sub-value">
-                          {thread.estimatedSevenDayUsagePercent === null
-                            ? 'Not enough logged samples'
-                            : '7-day bank at last activity'}
-                        </span>
-                        {thread.estimatedFiveHourUsagePercent !== null && (
-                          <span className="sub-value">
-                            {formatUsage(thread.estimatedFiveHourUsagePercent)} in 5-hour bank
-                          </span>
-                        )}
+                        {formatUsage(primaryUsage)}
+                        <span className="sub-value">{primaryUsageLabel}</span>
+                        {thread.estimatedFiveHourUsagePercent !== null &&
+                          thread.estimatedSevenDayUsagePercent !== null && (
+                            <span className="sub-value">
+                              {formatUsage(thread.estimatedSevenDayUsagePercent)} in 7-day bank
+                            </span>
+                          )}
                       </td>
                       <td className="numeric-cell">
                         {compact(thread.totalTokens)}
