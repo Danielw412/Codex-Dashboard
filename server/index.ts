@@ -202,7 +202,7 @@ function buildOverview(): DashboardOverview {
     : getRateLimitHistory(10_080, undefined, 15);
   const fiveProjection = calculateProjection(fiveHour, fiveHistory);
   const sevenProjection = calculateProjection(sevenDay, sevenHistory);
-  const usageEstimates = calculateThreadUsageEstimates();
+  const usageEstimates = calculateThreadUsageEstimates(fiveHour, sevenDay);
   const threads = getThreadSummaries(100).map((thread) => {
     const usage = usageEstimates.get(thread.threadId);
     return {
@@ -233,7 +233,7 @@ function buildOverview(): DashboardOverview {
   }
   if (connectionError) notices.push(`Codex account connection error: ${connectionError}`);
   notices.push(
-    'Thread quota usage is estimated by attributing observed quota changes to local token events in the same time interval. It is not exact billing telemetry.'
+    'Thread quota usage is estimated only within the specific quota bank active at the thread’s latest token event. It stays blank unless every local token event in that bank is bracketed by consistent quota snapshots.'
   );
   notices.push(
     'Prompt duration is exact when Codex reports a completed turn. Steering messages inside one turn use the time until the next prompt or turn completion.'

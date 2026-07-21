@@ -205,23 +205,69 @@ interface ThreadUsageAccumulator {
   sampleIntervals: number;
 }
 
-function estimateThreadUsageForWindow(durationMins: number, lookbackDays: number): Map<string, ThreadUsageAccumulator> {
-  const history = getRateLimitHistory(durationMins, undefined, lookbackDays);
-  if (history.length < 2) return new Map();
-  const earliest = Math.min(...history.map((point) => point.observedAt));
-  const tokenEvents = getThreadTokenEvents(earliest);
-  const accumulators = new Map<string, ThreadUsageAccumulator>();
+type ThreadTokenEvent = ReturnType<typeof getThreadTokenEvents>[number];
 
-  for (const group of groupHistory(history)) {
+function estimateThreadUsageForWindow(
+  currentWindow: RateLimitWindow | null,
+  lookbackDays: number
+): Map<string, ThreadUsageAccumulator> {
+  if (!currentWindow) return new Map();
+
+  const history = getRateLimitHistory(
+    currentWindow.windowDurationMins,
+    undefined,
+    lookbackDays
+  ).filter((point) => point.key === currentWindow.key);
+  const groups = groupHistory(history);
+  if (groups.length === 0) return new Map();
+
+  const durationSeconds = currentWindow.windowDurationMins * 60;
+  const earliestBankStart = Math.min(
+    ...groups.map((group) => group[0].resetsAt - durationSeconds)
+  );
+  const tokenEvents = getThreadTokenEvents(earliestBankStart);
+  const latestBankByThread = new Map<string, { resetAt: number; latestEventAt: number }>();
+  const reliableUsageByBank = new Map<number, Map<string, ThreadUsageAccumulator>>();
+
+  for (const group of groups) {
+    const resetAt = group[0].resetsAt;
+    const bankStart = resetAt - durationSeconds;
+    const bankEvents = tokenEvents.filter(
+      (event) => event.observedAt >= bankStart && event.observedAt < resetAt
+    );
+
+    for (const event of bankEvents) {
+      const previous = latestBankByThread.get(event.threadId);
+      if (!previous || event.observedAt > previous.latestEventAt) {
+        latestBankByThread.set(event.threadId, {
+          resetAt,
+          latestEventAt: event.observedAt
+        });
+      }
+    }
+
+    if (group.length < 2 || bankEvents.length === 0) continue;
+
+    const accumulators = new Map<string, ThreadUsageAccumulator>();
+    const coveredEvents = new Set<ThreadTokenEvent>();
+    let bankIsConsistent = true;
+
     for (let index = 1; index < group.length; index += 1) {
       const previous = group[index - 1];
       const current = group[index];
       const delta = current.usedPercent - previous.usedPercent;
-      if (delta <= 0) continue;
-      const events = tokenEvents.filter(
+
+      // A meaningful decrease indicates a quota correction. Continuing to add only
+      // later increases could count the same usage twice, so this bank is not reliable.
+      if (delta < -0.01) {
+        bankIsConsistent = false;
+        break;
+      }
+
+      const events = bankEvents.filter(
         (event) => event.observedAt > previous.observedAt && event.observedAt <= current.observedAt
       );
-      if (events.length === 0) continue;
+      if (events.length === 0 || delta <= 0) continue;
 
       const byThread = new Map<string, { tokens: number; cost: number }>();
       for (const event of events) {
@@ -232,6 +278,7 @@ function estimateThreadUsageForWindow(durationMins: number, lookbackDays: number
       }
       const totalCost = [...byThread.values()].reduce((sum, row) => sum + row.cost, 0);
       const totalTokens = [...byThread.values()].reduce((sum, row) => sum + row.tokens, 0);
+
       for (const [threadId, row] of byThread) {
         const weight = totalCost > 0
           ? row.cost / totalCost
@@ -244,18 +291,46 @@ function estimateThreadUsageForWindow(durationMins: number, lookbackDays: number
         accumulator.sampleIntervals += 1;
         accumulators.set(threadId, accumulator);
       }
+
+      for (const event of events) coveredEvents.add(event);
     }
+
+    if (!bankIsConsistent) continue;
+
+    const eventsByThread = new Map<string, ThreadTokenEvent[]>();
+    for (const event of bankEvents) {
+      const events = eventsByThread.get(event.threadId) ?? [];
+      events.push(event);
+      eventsByThread.set(event.threadId, events);
+    }
+
+    const reliable = new Map<string, ThreadUsageAccumulator>();
+    for (const [threadId, events] of eventsByThread) {
+      const estimate = accumulators.get(threadId);
+      if (!estimate || !events.every((event) => coveredEvents.has(event))) continue;
+      reliable.set(threadId, estimate);
+    }
+    reliableUsageByBank.set(resetAt, reliable);
   }
-  return accumulators;
+
+  const result = new Map<string, ThreadUsageAccumulator>();
+  for (const [threadId, latestBank] of latestBankByThread) {
+    const estimate = reliableUsageByBank.get(latestBank.resetAt)?.get(threadId);
+    if (estimate) result.set(threadId, estimate);
+  }
+  return result;
 }
 
-export function calculateThreadUsageEstimates(): Map<string, {
+export function calculateThreadUsageEstimates(
+  fiveHourWindow: RateLimitWindow | null,
+  sevenDayWindow: RateLimitWindow | null
+): Map<string, {
   fiveHourPercent: number | null;
   sevenDayPercent: number | null;
   sampleIntervals: number;
 }> {
-  const fiveHour = estimateThreadUsageForWindow(300, 8);
-  const sevenDay = estimateThreadUsageForWindow(10_080, 15);
+  const fiveHour = estimateThreadUsageForWindow(fiveHourWindow, 15);
+  const sevenDay = estimateThreadUsageForWindow(sevenDayWindow, 30);
   const ids = new Set([...fiveHour.keys(), ...sevenDay.keys()]);
   return new Map(
     [...ids].map((threadId) => {
