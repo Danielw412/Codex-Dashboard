@@ -514,6 +514,12 @@ export async function scanCodexSessions(): Promise<{
   const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
   const roots = [path.join(codexHome, 'sessions'), path.join(codexHome, 'archived_sessions')];
   const files = (await Promise.all(roots.map(listJsonlFiles))).flat();
+  const parserVersion = '2';
+  const markerPath = path.resolve(process.cwd(), 'data', '.session-parser-version');
+  const installedVersion = fs.existsSync(markerPath)
+    ? (await fs.promises.readFile(markerPath, 'utf8')).trim()
+    : '';
+  const forceRescan = installedVersion !== parserVersion;
   let updated = 0;
   let errors = 0;
 
@@ -521,7 +527,12 @@ export async function scanCodexSessions(): Promise<{
     try {
       const stat = await fs.promises.stat(sourceFile);
       const previous = getSessionFileState(sourceFile);
-      if (previous && previous.modifiedMs === stat.mtimeMs && previous.sizeBytes === stat.size) {
+      if (
+        !forceRescan &&
+        previous &&
+        previous.modifiedMs === stat.mtimeMs &&
+        previous.sizeBytes === stat.size
+      ) {
         continue;
       }
       const parsed = await parseSessionFile(sourceFile);
@@ -535,6 +546,11 @@ export async function scanCodexSessions(): Promise<{
       errors += 1;
       console.warn(`Failed to parse Codex session ${sourceFile}:`, error);
     }
+  }
+
+  if (forceRescan && errors === 0) {
+    await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
+    await fs.promises.writeFile(markerPath, `${parserVersion}\n`, 'utf8');
   }
 
   return { scanned: files.length, updated, errors };
