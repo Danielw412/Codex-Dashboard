@@ -5,11 +5,19 @@ import path from 'node:path';
 import readline from 'node:readline';
 import {
   getSessionFileState,
+  insertRateLimitSnapshot,
   replaceThreadData,
   type StoredThreadEvent
 } from './db.js';
 import { estimateUsageCost, findPricing } from './pricing.js';
-import type { SessionPartKind, ThreadPartSummary, TokenUsage } from './types.js';
+import type {
+  PricingStatus,
+  PromptMetric,
+  RateLimitWindow,
+  SessionPartKind,
+  ThreadPartSummary,
+  TokenUsage
+} from './types.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -24,6 +32,15 @@ function toNumber(value: unknown): number {
     if (Number.isFinite(parsed)) return Math.max(0, Math.round(parsed));
   }
   return 0;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
 }
 
 function parseTimestamp(value: unknown): number | null {
@@ -134,26 +151,24 @@ function detectPartKind(record: JsonRecord): SessionPartKind | null {
   if (!payload) return null;
 
   const threadSource = typeof payload.thread_source === 'string' ? payload.thread_source.toLowerCase() : '';
-  const source = payload.source;
-  const sourceText = JSON.stringify(source ?? '').toLowerCase();
+  const sourceText = JSON.stringify(payload.source ?? '').toLowerCase();
   if (sourceText.includes('guardian') || sourceText.includes('review')) return 'reviewer';
-  if (threadSource === 'subagent' || (isRecord(source) && isRecord(source.subagent))) return 'subagent';
+  if (threadSource === 'subagent' || (isRecord(payload.source) && isRecord(payload.source.subagent))) {
+    return 'subagent';
+  }
   return 'main';
 }
 
 function extractRawUserMessage(record: JsonRecord): string | null {
   const payload = isRecord(record.payload) ? record.payload : null;
   if (!payload) return null;
-
-  // event_msg/user_message is the canonical user-authored entry. Response-item
-  // messages can also contain injected app/plugin context that is not a real prompt.
   if (record.type === 'event_msg' && payload.type === 'user_message') {
     return typeof payload.message === 'string' ? payload.message : null;
   }
   return null;
 }
 
-function cleanUserMessage(message: string): string | null {
+function cleanUserMessage(message: string, maxLength = 1000): string | null {
   let text = message.replace(/\r\n/g, '\n').trim();
   const requestMarker = /##\s*My request for Codex:\s*/i.exec(text);
   if (requestMarker) text = text.slice(requestMarker.index + requestMarker[0].length).trim();
@@ -167,8 +182,7 @@ function cleanUserMessage(message: string): string | null {
   ) {
     return null;
   }
-
-  return normalized.slice(0, 120);
+  return normalized.slice(0, maxLength);
 }
 
 function addUsage(target: TokenUsage, usage: TokenUsage): void {
@@ -189,6 +203,49 @@ function defaultUsage(): TokenUsage {
   };
 }
 
+function labelForWindow(durationMins: number, fallback: string): string {
+  if (Math.abs(durationMins - 300) <= 5) return '5-hour window';
+  if (Math.abs(durationMins - 10_080) <= 60) return '7-day window';
+  return fallback;
+}
+
+function extractRateLimitWindows(record: JsonRecord, observedAt: number): RateLimitWindow[] {
+  const payload = isRecord(record.payload) ? record.payload : null;
+  const limits = payload && isRecord(payload.rate_limits ?? payload.rateLimits)
+    ? (payload.rate_limits ?? payload.rateLimits) as JsonRecord
+    : null;
+  if (!limits) return [];
+
+  const limitId = typeof limits.limit_id === 'string'
+    ? limits.limit_id
+    : typeof limits.limitId === 'string'
+      ? limits.limitId
+      : 'codex';
+  const limitName = typeof limits.limit_name === 'string'
+    ? limits.limit_name
+    : typeof limits.limitName === 'string'
+      ? limits.limitName
+      : 'Codex usage';
+  const result: RateLimitWindow[] = [];
+  for (const slot of ['primary', 'secondary', 'individual_limit', 'individualLimit']) {
+    const raw = limits[slot];
+    if (!isRecord(raw)) continue;
+    const usedPercent = toFiniteNumber(raw.used_percent ?? raw.usedPercent);
+    const windowDurationMins = toNumber(raw.window_minutes ?? raw.windowDurationMins);
+    const resetsAt = parseTimestamp(raw.resets_at ?? raw.resetsAt);
+    if (usedPercent === null || windowDurationMins <= 0 || resetsAt === null) continue;
+    result.push({
+      key: `${limitId}:${slot.replace('_', '-')}`,
+      label: labelForWindow(windowDurationMins, limitName),
+      usedPercent: Math.max(0, usedPercent),
+      windowDurationMins,
+      resetsAt,
+      observedAt
+    });
+  }
+  return result;
+}
+
 async function listJsonlFiles(root: string): Promise<string[]> {
   const result: string[] = [];
   if (!fs.existsSync(root)) return result;
@@ -205,9 +262,18 @@ async function listJsonlFiles(root: string): Promise<string[]> {
   return result;
 }
 
+interface PromptAccumulator extends PromptMetric {
+  firstTokenAt: number | null;
+  modelTokens: Map<string, number>;
+  totalCost: number;
+  pricedEvents: number;
+  hasUnpriced: boolean;
+}
+
 interface ParsedSession {
   summary: ThreadPartSummary;
   events: StoredThreadEvent[];
+  prompts: PromptMetric[];
 }
 
 async function parseSessionFile(sourceFile: string): Promise<ParsedSession | null> {
@@ -223,13 +289,59 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
   let updatedAt: number | null = null;
   let lineNumber = 0;
   let userMessageCount = 0;
+  let promptSequence = 0;
+  let currentTurnId: string | null = null;
+  let currentTaskStartedAt: number | null = null;
+  let promptsInCurrentTurn = 0;
+  let activePrompt: PromptAccumulator | null = null;
   const seenUserMessages = new Set<string>();
   const events: StoredThreadEvent[] = [];
+  const prompts: PromptMetric[] = [];
   const totals = defaultUsage();
   const modelTokens = new Map<string, number>();
   const models = new Set<string>();
   let totalCost = 0;
   let pricedEvents = 0;
+
+  const finalizePrompt = (
+    completedAt: number | null,
+    reportedDurationMs: number | null = null,
+    reportedTimeToFirstTokenMs: number | null = null
+  ): void => {
+    if (!activePrompt) return;
+    const prompt = activePrompt;
+    const derivedDuration = completedAt === null ? null : Math.max(0, (completedAt - prompt.startedAt) * 1000);
+    const canUseReportedTiming = promptsInCurrentTurn === 1 && currentTaskStartedAt !== null;
+    prompt.completedAt = completedAt;
+    prompt.durationMs = canUseReportedTiming && reportedDurationMs !== null
+      ? reportedDurationMs
+      : derivedDuration;
+    prompt.timeToFirstTokenMs = canUseReportedTiming && reportedTimeToFirstTokenMs !== null
+      ? reportedTimeToFirstTokenMs
+      : prompt.firstTokenAt === null
+        ? null
+        : Math.max(0, (prompt.firstTokenAt - prompt.startedAt) * 1000);
+    prompt.timingEstimated = !(canUseReportedTiming && reportedDurationMs !== null);
+    prompt.primaryModel = [...prompt.modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
+      ?? prompt.primaryModel;
+    prompt.models = [...prompt.modelTokens.keys()];
+    prompt.estimatedApiCostUsd = prompt.pricedEvents > 0 ? prompt.totalCost : null;
+    prompt.pricingStatus = prompt.pricedEvents === 0
+      ? 'unknown'
+      : prompt.hasUnpriced
+        ? 'partial'
+        : 'exact-model-match';
+    const {
+      firstTokenAt: _firstTokenAt,
+      modelTokens: _modelTokens,
+      totalCost: _totalCost,
+      pricedEvents: _pricedEvents,
+      hasUnpriced: _hasUnpriced,
+      ...stored
+    } = prompt;
+    prompts.push(stored);
+    activePrompt = null;
+  };
 
   for await (const line of lines) {
     lineNumber += 1;
@@ -253,15 +365,51 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
     projectPath ??= extractProjectPath(record);
     partKind = detectPartKind(record) ?? partKind;
 
+    const payload = isRecord(record.payload) ? record.payload : null;
+    const type = eventType(record);
+    if (type === 'task_started' && payload) {
+      finalizePrompt(timestamp);
+      currentTurnId = typeof payload.turn_id === 'string' ? payload.turn_id : currentTurnId;
+      currentTaskStartedAt = parseTimestamp(payload.started_at) ?? timestamp;
+      promptsInCurrentTurn = 0;
+    }
+
     const rawUserMessage = extractRawUserMessage(record);
     if (rawUserMessage) {
       const dedupeKey = rawUserMessage.replace(/\s+/g, ' ').trim();
       if (!seenUserMessages.has(dedupeKey)) {
         seenUserMessages.add(dedupeKey);
         const cleaned = cleanUserMessage(rawUserMessage);
-        if (cleaned) {
+        if (cleaned && partKind === 'main') {
+          finalizePrompt(timestamp);
           userMessageCount += 1;
-          title ??= cleaned;
+          promptSequence += 1;
+          promptsInCurrentTurn += 1;
+          title ??= cleaned.slice(0, 120);
+          const promptStartedAt = timestamp ?? currentTaskStartedAt ?? Math.floor(Date.now() / 1000);
+          activePrompt = {
+            promptId: crypto.createHash('sha1').update(`${sourceFile}:${lineNumber}:${cleaned}`).digest('hex'),
+            sourceFile,
+            threadId: '',
+            turnId: currentTurnId,
+            sequence: promptSequence,
+            prompt: cleaned,
+            startedAt: promptStartedAt,
+            completedAt: null,
+            durationMs: null,
+            timeToFirstTokenMs: null,
+            timingEstimated: true,
+            primaryModel: currentModel,
+            models: [],
+            ...defaultUsage(),
+            estimatedApiCostUsd: null,
+            pricingStatus: 'unknown',
+            firstTokenAt: null,
+            modelTokens: new Map<string, number>(),
+            totalCost: 0,
+            pricedEvents: 0,
+            hasUnpriced: false
+          };
         }
       }
     }
@@ -273,41 +421,68 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
     }
 
     const usage = findIncrementalUsage(record);
-    if (!usage) continue;
+    if (usage) {
+      const observedAt = timestamp ?? updatedAt ?? Math.floor(Date.now() / 1000);
+      for (const limit of extractRateLimitWindows(record, observedAt)) insertRateLimitSnapshot(limit);
+      const cost = estimateUsageCost(currentModel, usage);
+      const eventKey = crypto
+        .createHash('sha1')
+        .update(`${sourceFile}:${lineNumber}:${observedAt}`)
+        .digest('hex');
+      events.push({
+        eventKey,
+        threadId: '',
+        sourceFile,
+        observedAt,
+        model: currentModel,
+        ...usage,
+        estimatedApiCostUsd: cost
+      });
+      addUsage(totals, usage);
+      models.add(currentModel);
+      modelTokens.set(currentModel, (modelTokens.get(currentModel) ?? 0) + usage.totalTokens);
+      if (cost !== null) {
+        totalCost += cost;
+        pricedEvents += 1;
+      }
 
-    const observedAt = timestamp ?? updatedAt ?? Math.floor(Date.now() / 1000);
-    const cost = estimateUsageCost(currentModel, usage);
-    const eventKey = crypto
-      .createHash('sha1')
-      .update(`${sourceFile}:${lineNumber}:${observedAt}`)
-      .digest('hex');
-    events.push({
-      eventKey,
-      threadId: '',
-      sourceFile,
-      observedAt,
-      model: currentModel,
-      ...usage,
-      estimatedApiCostUsd: cost
-    });
-    addUsage(totals, usage);
-    models.add(currentModel);
-    modelTokens.set(currentModel, (modelTokens.get(currentModel) ?? 0) + usage.totalTokens);
-    if (cost !== null) {
-      totalCost += cost;
-      pricedEvents += 1;
+      if (activePrompt) {
+        addUsage(activePrompt, usage);
+        activePrompt.firstTokenAt ??= observedAt;
+        activePrompt.modelTokens.set(
+          currentModel,
+          (activePrompt.modelTokens.get(currentModel) ?? 0) + usage.totalTokens
+        );
+        if (cost === null) activePrompt.hasUnpriced = true;
+        else {
+          activePrompt.totalCost += cost;
+          activePrompt.pricedEvents += 1;
+        }
+      }
+    }
+
+    if (type === 'task_complete' && payload) {
+      const completedAt = parseTimestamp(payload.completed_at) ?? timestamp;
+      const durationMs = toFiniteNumber(payload.duration_ms);
+      const ttftMs = toFiniteNumber(payload.time_to_first_token_ms);
+      finalizePrompt(completedAt, durationMs, ttftMs);
+      currentTurnId = null;
+      currentTaskStartedAt = null;
+      promptsInCurrentTurn = 0;
     }
   }
 
-  if (events.length === 0) return null;
+  finalizePrompt(updatedAt);
+  if (events.length === 0 && prompts.length === 0) return null;
   const fallbackId = crypto.createHash('sha1').update(sourceFile).digest('hex');
   const finalThreadId = threadId ?? fallbackId;
   for (const event of events) event.threadId = finalThreadId;
+  for (const prompt of prompts) prompt.threadId = finalThreadId;
 
   const primaryModel =
     [...modelTokens.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? currentModel;
   const unknownModels = [...models].filter((model) => findPricing(model) === null);
-  const pricingStatus: ThreadPartSummary['pricingStatus'] =
+  const pricingStatus: PricingStatus =
     pricedEvents === 0 ? 'unknown' : unknownModels.length > 0 ? 'partial' : 'exact-model-match';
 
   return {
@@ -326,7 +501,8 @@ async function parseSessionFile(sourceFile: string): Promise<ParsedSession | nul
       partKind,
       userMessageCount: partKind === 'main' ? userMessageCount : 0
     },
-    events
+    events,
+    prompts
   };
 }
 
@@ -350,7 +526,7 @@ export async function scanCodexSessions(): Promise<{
       }
       const parsed = await parseSessionFile(sourceFile);
       if (!parsed) continue;
-      replaceThreadData(parsed.summary, parsed.events, {
+      replaceThreadData(parsed.summary, parsed.events, parsed.prompts, {
         modifiedMs: stat.mtimeMs,
         sizeBytes: stat.size
       });
