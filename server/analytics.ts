@@ -3,6 +3,7 @@ import {
   getRateLimitHistory,
   getThreadTokenEvents
 } from './db.js';
+import { estimateThreadUsageForBank } from './threadUsage.js';
 import type {
   LimitProjection,
   ModelEfficiency,
@@ -277,8 +278,6 @@ interface ThreadUsageAccumulator {
   sampleIntervals: number;
 }
 
-type ThreadTokenEvent = ReturnType<typeof getThreadTokenEvents>[number];
-
 function estimateThreadUsageForWindow(
   currentWindow: RateLimitWindow | null,
   lookbackDays: number
@@ -318,71 +317,7 @@ function estimateThreadUsageForWindow(
       }
     }
 
-    if (group.length < 2 || bankEvents.length === 0) continue;
-
-    const accumulators = new Map<string, ThreadUsageAccumulator>();
-    const coveredEvents = new Set<ThreadTokenEvent>();
-    let bankIsConsistent = true;
-
-    for (let index = 1; index < group.length; index += 1) {
-      const previous = group[index - 1];
-      const current = group[index];
-      const delta = current.usedPercent - previous.usedPercent;
-
-      // A meaningful decrease indicates a quota correction. Continuing to add only
-      // later increases could count the same usage twice, so this bank is not reliable.
-      if (delta < -0.01) {
-        bankIsConsistent = false;
-        break;
-      }
-
-      const events = bankEvents.filter(
-        (event) => event.observedAt > previous.observedAt && event.observedAt <= current.observedAt
-      );
-      if (events.length === 0 || delta <= 0) continue;
-
-      const byThread = new Map<string, { tokens: number; cost: number }>();
-      for (const event of events) {
-        const row = byThread.get(event.threadId) ?? { tokens: 0, cost: 0 };
-        row.tokens += event.totalTokens;
-        row.cost += event.estimatedApiCostUsd;
-        byThread.set(event.threadId, row);
-      }
-      const totalCost = [...byThread.values()].reduce((sum, row) => sum + row.cost, 0);
-      const totalTokens = [...byThread.values()].reduce((sum, row) => sum + row.tokens, 0);
-
-      for (const [threadId, row] of byThread) {
-        const weight = totalCost > 0
-          ? row.cost / totalCost
-          : totalTokens > 0
-            ? row.tokens / totalTokens
-            : 0;
-        if (weight <= 0) continue;
-        const accumulator = accumulators.get(threadId) ?? { percent: 0, sampleIntervals: 0 };
-        accumulator.percent += delta * weight;
-        accumulator.sampleIntervals += 1;
-        accumulators.set(threadId, accumulator);
-      }
-
-      for (const event of events) coveredEvents.add(event);
-    }
-
-    if (!bankIsConsistent) continue;
-
-    const eventsByThread = new Map<string, ThreadTokenEvent[]>();
-    for (const event of bankEvents) {
-      const events = eventsByThread.get(event.threadId) ?? [];
-      events.push(event);
-      eventsByThread.set(event.threadId, events);
-    }
-
-    const reliable = new Map<string, ThreadUsageAccumulator>();
-    for (const [threadId, events] of eventsByThread) {
-      const estimate = accumulators.get(threadId);
-      if (!estimate || !events.every((event) => coveredEvents.has(event))) continue;
-      reliable.set(threadId, estimate);
-    }
-    reliableUsageByBank.set(resetAt, reliable);
+    reliableUsageByBank.set(resetAt, estimateThreadUsageForBank(group, bankEvents));
   }
 
   const result = new Map<string, ThreadUsageAccumulator>();
