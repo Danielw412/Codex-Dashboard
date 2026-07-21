@@ -35,6 +35,23 @@ export interface DailyUsage {
   source: 'account' | 'local';
 }
 
+export type SessionPartKind = 'main' | 'reviewer' | 'subagent';
+
+export interface ThreadPartSummary extends TokenUsage {
+  threadId: string;
+  title: string | null;
+  projectPath: string | null;
+  startedAt: number | null;
+  updatedAt: number | null;
+  primaryModel: string;
+  models: string[];
+  estimatedApiCostUsd: number | null;
+  pricingStatus: 'exact-model-match' | 'partial' | 'unknown';
+  sourceFile: string;
+  partKind: SessionPartKind;
+  userMessageCount: number;
+}
+
 export interface ThreadSummary extends TokenUsage {
   threadId: string;
   title: string;
@@ -46,6 +63,9 @@ export interface ThreadSummary extends TokenUsage {
   estimatedApiCostUsd: number | null;
   pricingStatus: 'exact-model-match' | 'partial' | 'unknown';
   sourceFile: string;
+  userMessageCount: number;
+  reviewerTokens: number;
+  partCount: number;
 }
 
 export interface ModelEfficiency {

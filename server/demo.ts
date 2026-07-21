@@ -17,15 +17,18 @@ const threads: ThreadSummary[] = [
     startedAt: now - 7200,
     updatedAt: now - 1800,
     primaryModel: 'gpt-5.6-sol',
-    models: ['gpt-5.6-sol'],
+    models: ['gpt-5.6-sol', 'codex-auto-review'],
     inputTokens: 1_460_000,
     cachedInputTokens: 1_210_000,
     outputTokens: 42_000,
     reasoningOutputTokens: 17_000,
     totalTokens: 1_502_000,
     estimatedApiCostUsd: 3.78,
-    pricingStatus: 'exact-model-match',
-    sourceFile: 'demo'
+    pricingStatus: 'partial',
+    sourceFile: 'demo',
+    userMessageCount: 3,
+    reviewerTokens: 92_000,
+    partCount: 2
   },
   {
     threadId: 'demo-2',
@@ -42,7 +45,10 @@ const threads: ThreadSummary[] = [
     totalTokens: 784_000,
     estimatedApiCostUsd: 1.02,
     pricingStatus: 'exact-model-match',
-    sourceFile: 'demo'
+    sourceFile: 'demo',
+    userMessageCount: 1,
+    reviewerTokens: 0,
+    partCount: 1
   }
 ];
 
@@ -107,7 +113,7 @@ export function demoOverview(): DashboardOverview {
       totalTokens: 2_286_000,
       estimatedApiCostUsd: 4.8,
       pricedThreads: 2,
-      unknownPriceThreads: 0
+      unknownPriceThreads: 1
     },
     threads,
     modelEfficiency: [

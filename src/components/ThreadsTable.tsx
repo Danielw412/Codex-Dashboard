@@ -1,4 +1,9 @@
-import { CircleDollarSign, FolderOpen, Layers3 } from 'lucide-react';
+import {
+  CircleDollarSign,
+  FolderOpen,
+  MessageSquareText,
+  ShieldCheck
+} from 'lucide-react';
 import type { ThreadSummary } from '../types';
 
 function compact(value: number): string {
@@ -26,7 +31,7 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
           <p className="eyebrow">Local history</p>
           <h2>Threads</h2>
           <p className="panel-subtitle">
-            Parsed from local Codex session logs. Cost uses API-equivalent public pricing.
+            Parent threads include their auto-review overhead. Cost uses API-equivalent public pricing.
           </p>
         </div>
       </div>
@@ -54,16 +59,26 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
                       <FolderOpen size={12} />
                       {thread.projectPath ?? 'Project path unavailable'}
                     </div>
-                  </td>
-                  <td>
-                    <span className="model-label">{thread.primaryModel}</span>
-                    {thread.models.length > 1 && (
+                    {thread.userMessageCount > 1 && (
                       <span className="muted-inline">
-                        <Layers3 size={12} /> {thread.models.length} models
+                        <MessageSquareText size={12} /> {thread.userMessageCount} prompts in thread
                       </span>
                     )}
                   </td>
-                  <td className="numeric-cell">{compact(thread.totalTokens)}</td>
+                  <td>
+                    <span className="model-label">{thread.primaryModel}</span>
+                    {thread.reviewerTokens > 0 && (
+                      <span className="muted-inline">
+                        <ShieldCheck size={12} /> auto-review included
+                      </span>
+                    )}
+                  </td>
+                  <td className="numeric-cell">
+                    {compact(thread.totalTokens)}
+                    {thread.reviewerTokens > 0 && (
+                      <span className="sub-value">{compact(thread.reviewerTokens)} review overhead</span>
+                    )}
+                  </td>
                   <td className="numeric-cell">
                     {compact(thread.cachedInputTokens)}
                     <span className="sub-value">

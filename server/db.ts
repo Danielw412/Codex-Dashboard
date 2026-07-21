@@ -1,7 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { DailyUsage, ModelEfficiency, RateLimitWindow, ThreadSummary, TokenUsage } from './types.js';
+import type {
+  DailyUsage,
+  ModelEfficiency,
+  RateLimitWindow,
+  SessionPartKind,
+  ThreadPartSummary,
+  ThreadSummary,
+  TokenUsage
+} from './types.js';
 
 const dataDir = path.resolve(process.cwd(), 'data');
 fs.mkdirSync(dataDir, { recursive: true });
@@ -29,17 +37,13 @@ db.exec(`
     observed_at INTEGER NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS session_files (
+  CREATE TABLE IF NOT EXISTS session_parts (
     source_file TEXT PRIMARY KEY,
     modified_ms REAL NOT NULL,
     size_bytes INTEGER NOT NULL,
-    thread_id TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS thread_summaries (
-    thread_id TEXT PRIMARY KEY,
-    source_file TEXT NOT NULL,
-    title TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    part_kind TEXT NOT NULL,
+    title TEXT,
     project_path TEXT,
     started_at INTEGER,
     updated_at INTEGER,
@@ -51,11 +55,15 @@ db.exec(`
     reasoning_output_tokens INTEGER NOT NULL,
     total_tokens INTEGER NOT NULL,
     estimated_cost_usd REAL,
-    pricing_status TEXT NOT NULL
+    pricing_status TEXT NOT NULL,
+    user_message_count INTEGER NOT NULL DEFAULT 0
   );
+  CREATE INDEX IF NOT EXISTS idx_session_parts_thread
+    ON session_parts(thread_id, part_kind, updated_at);
 
-  CREATE TABLE IF NOT EXISTS thread_token_events (
+  CREATE TABLE IF NOT EXISTS session_part_token_events (
     event_key TEXT PRIMARY KEY,
+    source_file TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     observed_at INTEGER NOT NULL,
     model TEXT NOT NULL,
@@ -65,10 +73,12 @@ db.exec(`
     reasoning_output_tokens INTEGER NOT NULL,
     total_tokens INTEGER NOT NULL,
     estimated_cost_usd REAL,
-    FOREIGN KEY(thread_id) REFERENCES thread_summaries(thread_id) ON DELETE CASCADE
+    FOREIGN KEY(source_file) REFERENCES session_parts(source_file) ON DELETE CASCADE
   );
-  CREATE INDEX IF NOT EXISTS idx_thread_events_time
-    ON thread_token_events(observed_at);
+  CREATE INDEX IF NOT EXISTS idx_session_part_events_time
+    ON session_part_token_events(observed_at);
+  CREATE INDEX IF NOT EXISTS idx_session_part_events_thread
+    ON session_part_token_events(thread_id, observed_at);
 `);
 
 function rows<T>(value: unknown): T[] {
@@ -148,6 +158,7 @@ export function getAccountDailyUsage(days = 7): DailyUsage[] {
 export interface StoredThreadEvent extends TokenUsage {
   eventKey: string;
   threadId: string;
+  sourceFile: string;
   observedAt: number;
   model: string;
   estimatedApiCostUsd: number | null;
@@ -160,25 +171,29 @@ export function getSessionFileState(sourceFile: string): {
 } | null {
   const result = db.prepare(`
     SELECT modified_ms AS modifiedMs, size_bytes AS sizeBytes, thread_id AS threadId
-    FROM session_files WHERE source_file = ?
+    FROM session_parts WHERE source_file = ?
   `).get(sourceFile);
   return (result as { modifiedMs: number; sizeBytes: number; threadId: string } | undefined) ?? null;
 }
 
 export function replaceThreadData(
-  summary: ThreadSummary,
+  summary: ThreadPartSummary,
   events: StoredThreadEvent[],
   fileState: { modifiedMs: number; sizeBytes: number }
 ): void {
-  const upsertSummary = db.prepare(`
-    INSERT INTO thread_summaries (
-      thread_id, source_file, title, project_path, started_at, updated_at,
-      primary_model, models_json, input_tokens, cached_input_tokens,
-      output_tokens, reasoning_output_tokens, total_tokens,
-      estimated_cost_usd, pricing_status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(thread_id) DO UPDATE SET
-      source_file = excluded.source_file,
+  const upsertPart = db.prepare(`
+    INSERT INTO session_parts (
+      source_file, modified_ms, size_bytes, thread_id, part_kind, title,
+      project_path, started_at, updated_at, primary_model, models_json,
+      input_tokens, cached_input_tokens, output_tokens,
+      reasoning_output_tokens, total_tokens, estimated_cost_usd,
+      pricing_status, user_message_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(source_file) DO UPDATE SET
+      modified_ms = excluded.modified_ms,
+      size_bytes = excluded.size_bytes,
+      thread_id = excluded.thread_id,
+      part_kind = excluded.part_kind,
       title = excluded.title,
       project_path = excluded.project_path,
       started_at = excluded.started_at,
@@ -191,29 +206,25 @@ export function replaceThreadData(
       reasoning_output_tokens = excluded.reasoning_output_tokens,
       total_tokens = excluded.total_tokens,
       estimated_cost_usd = excluded.estimated_cost_usd,
-      pricing_status = excluded.pricing_status
+      pricing_status = excluded.pricing_status,
+      user_message_count = excluded.user_message_count
   `);
   const insertEvent = db.prepare(`
-    INSERT INTO thread_token_events (
-      event_key, thread_id, observed_at, model, input_tokens,
+    INSERT INTO session_part_token_events (
+      event_key, source_file, thread_id, observed_at, model, input_tokens,
       cached_input_tokens, output_tokens, reasoning_output_tokens,
       total_tokens, estimated_cost_usd
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const upsertFile = db.prepare(`
-    INSERT INTO session_files (source_file, modified_ms, size_bytes, thread_id)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(source_file) DO UPDATE SET
-      modified_ms = excluded.modified_ms,
-      size_bytes = excluded.size_bytes,
-      thread_id = excluded.thread_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   db.exec('BEGIN IMMEDIATE;');
   try {
-    upsertSummary.run(
-      summary.threadId,
+    upsertPart.run(
       summary.sourceFile,
+      fileState.modifiedMs,
+      fileState.sizeBytes,
+      summary.threadId,
+      summary.partKind,
       summary.title,
       summary.projectPath,
       summary.startedAt,
@@ -226,12 +237,14 @@ export function replaceThreadData(
       summary.reasoningOutputTokens,
       summary.totalTokens,
       summary.estimatedApiCostUsd,
-      summary.pricingStatus
+      summary.pricingStatus,
+      summary.userMessageCount
     );
-    db.prepare('DELETE FROM thread_token_events WHERE thread_id = ?').run(summary.threadId);
+    db.prepare('DELETE FROM session_part_token_events WHERE source_file = ?').run(summary.sourceFile);
     for (const event of events) {
       insertEvent.run(
         event.eventKey,
+        event.sourceFile,
         event.threadId,
         event.observedAt,
         event.model,
@@ -243,7 +256,6 @@ export function replaceThreadData(
         event.estimatedApiCostUsd
       );
     }
-    upsertFile.run(summary.sourceFile, fileState.modifiedMs, fileState.sizeBytes, summary.threadId);
     db.exec('COMMIT;');
   } catch (error) {
     db.exec('ROLLBACK;');
@@ -251,24 +263,145 @@ export function replaceThreadData(
   }
 }
 
-export function getThreadSummaries(limit = 100): ThreadSummary[] {
-  const result = db.prepare(`
-    SELECT thread_id AS threadId, source_file AS sourceFile, title,
-           project_path AS projectPath, started_at AS startedAt,
+interface PartRow extends TokenUsage {
+  sourceFile: string;
+  threadId: string;
+  partKind: SessionPartKind;
+  title: string | null;
+  projectPath: string | null;
+  startedAt: number | null;
+  updatedAt: number | null;
+  primaryModel: string;
+  modelsJson: string;
+  estimatedApiCostUsd: number | null;
+  pricingStatus: ThreadSummary['pricingStatus'];
+  userMessageCount: number;
+}
+
+interface ModelTokenRow {
+  threadId: string;
+  model: string;
+  totalTokens: number;
+}
+
+function buildThreadSummaries(): ThreadSummary[] {
+  const parts = rows<PartRow>(db.prepare(`
+    SELECT source_file AS sourceFile, thread_id AS threadId, part_kind AS partKind,
+           title, project_path AS projectPath, started_at AS startedAt,
            updated_at AS updatedAt, primary_model AS primaryModel,
            models_json AS modelsJson, input_tokens AS inputTokens,
-           cached_input_tokens AS cachedInputTokens,
-           output_tokens AS outputTokens,
+           cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens,
            reasoning_output_tokens AS reasoningOutputTokens,
            total_tokens AS totalTokens, estimated_cost_usd AS estimatedApiCostUsd,
-           pricing_status AS pricingStatus
-    FROM thread_summaries
-    ORDER BY COALESCE(updated_at, started_at, 0) DESC
-    LIMIT ?
-  `).all(limit);
-  return rows<Omit<ThreadSummary, 'models'> & { modelsJson: string }>(result).map(
-    ({ modelsJson, ...row }) => ({ ...row, models: JSON.parse(modelsJson) as string[] })
-  );
+           pricing_status AS pricingStatus, user_message_count AS userMessageCount
+    FROM session_parts
+    ORDER BY COALESCE(started_at, updated_at, 0) ASC
+  `).all());
+
+  const mainModelTokens = rows<ModelTokenRow>(db.prepare(`
+    SELECT e.thread_id AS threadId, e.model, SUM(e.total_tokens) AS totalTokens
+    FROM session_part_token_events e
+    JOIN session_parts p ON p.source_file = e.source_file
+    WHERE p.part_kind = 'main' AND lower(e.model) <> 'codex-auto-review'
+    GROUP BY e.thread_id, e.model
+  `).all());
+  const modelWeights = new Map<string, Map<string, number>>();
+  for (const row of mainModelTokens) {
+    const weights = modelWeights.get(row.threadId) ?? new Map<string, number>();
+    weights.set(row.model, row.totalTokens);
+    modelWeights.set(row.threadId, weights);
+  }
+
+  const grouped = new Map<string, ThreadSummary & { hasPriced: boolean; hasUnpriced: boolean }>();
+  for (const part of parts) {
+    const partModels = JSON.parse(part.modelsJson) as string[];
+    let thread = grouped.get(part.threadId);
+    if (!thread) {
+      thread = {
+        threadId: part.threadId,
+        title: part.partKind === 'main' && part.title ? part.title : 'Untitled Codex thread',
+        projectPath: part.partKind === 'main' ? part.projectPath : null,
+        startedAt: part.startedAt,
+        updatedAt: part.updatedAt,
+        primaryModel: part.partKind === 'main' ? part.primaryModel : 'unknown',
+        models: [],
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 0,
+        estimatedApiCostUsd: null,
+        pricingStatus: 'unknown',
+        sourceFile: part.sourceFile,
+        userMessageCount: 0,
+        reviewerTokens: 0,
+        partCount: 0,
+        hasPriced: false,
+        hasUnpriced: false
+      };
+      grouped.set(part.threadId, thread);
+    }
+
+    if (part.partKind === 'main') {
+      if (thread.title === 'Untitled Codex thread' && part.title) thread.title = part.title;
+      if (!thread.projectPath && part.projectPath) thread.projectPath = part.projectPath;
+      if (thread.primaryModel === 'unknown' && part.primaryModel !== 'unknown') {
+        thread.primaryModel = part.primaryModel;
+      }
+      thread.sourceFile = part.sourceFile;
+      thread.userMessageCount += part.userMessageCount;
+    }
+
+    thread.startedAt =
+      thread.startedAt === null
+        ? part.startedAt
+        : part.startedAt === null
+          ? thread.startedAt
+          : Math.min(thread.startedAt, part.startedAt);
+    thread.updatedAt =
+      thread.updatedAt === null
+        ? part.updatedAt
+        : part.updatedAt === null
+          ? thread.updatedAt
+          : Math.max(thread.updatedAt, part.updatedAt);
+    thread.inputTokens += part.inputTokens;
+    thread.cachedInputTokens += part.cachedInputTokens;
+    thread.outputTokens += part.outputTokens;
+    thread.reasoningOutputTokens += part.reasoningOutputTokens;
+    thread.totalTokens += part.totalTokens;
+    if (part.partKind === 'reviewer') thread.reviewerTokens += part.totalTokens;
+    thread.partCount += 1;
+    for (const model of partModels) {
+      if (!thread.models.includes(model)) thread.models.push(model);
+    }
+    if (part.estimatedApiCostUsd !== null) {
+      thread.estimatedApiCostUsd = (thread.estimatedApiCostUsd ?? 0) + part.estimatedApiCostUsd;
+      thread.hasPriced = true;
+    }
+    if (part.pricingStatus !== 'exact-model-match') thread.hasUnpriced = true;
+  }
+
+  for (const thread of grouped.values()) {
+    const weights = modelWeights.get(thread.threadId);
+    const weightedPrimary = weights
+      ? [...weights.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
+      : null;
+    if (weightedPrimary) thread.primaryModel = weightedPrimary;
+    if (thread.primaryModel === 'codex-auto-review') thread.primaryModel = 'unknown';
+    thread.pricingStatus = !thread.hasPriced
+      ? 'unknown'
+      : thread.hasUnpriced
+        ? 'partial'
+        : 'exact-model-match';
+  }
+
+  return [...grouped.values()]
+    .map(({ hasPriced: _hasPriced, hasUnpriced: _hasUnpriced, ...thread }) => thread)
+    .sort((a, b) => (b.updatedAt ?? b.startedAt ?? 0) - (a.updatedAt ?? a.startedAt ?? 0));
+}
+
+export function getThreadSummaries(limit = 100): ThreadSummary[] {
+  return buildThreadSummaries().slice(0, limit);
 }
 
 type TokenTotals = TokenUsage & {
@@ -279,19 +412,32 @@ type TokenTotals = TokenUsage & {
 };
 
 export function getTokenTotals(): TokenTotals {
-  const result = db.prepare(`
-    SELECT COUNT(*) AS threads,
-           COALESCE(SUM(input_tokens), 0) AS inputTokens,
-           COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens,
-           COALESCE(SUM(output_tokens), 0) AS outputTokens,
-           COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningOutputTokens,
-           COALESCE(SUM(total_tokens), 0) AS totalTokens,
-           COALESCE(SUM(estimated_cost_usd), 0) AS estimatedApiCostUsd,
-           COALESCE(SUM(CASE WHEN estimated_cost_usd IS NOT NULL THEN 1 ELSE 0 END), 0) AS pricedThreads,
-           COALESCE(SUM(CASE WHEN estimated_cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unknownPriceThreads
-    FROM thread_summaries
-  `).get();
-  return result as unknown as TokenTotals;
+  const summaries = buildThreadSummaries();
+  return summaries.reduce<TokenTotals>(
+    (total, thread) => {
+      total.threads += 1;
+      total.inputTokens += thread.inputTokens;
+      total.cachedInputTokens += thread.cachedInputTokens;
+      total.outputTokens += thread.outputTokens;
+      total.reasoningOutputTokens += thread.reasoningOutputTokens;
+      total.totalTokens += thread.totalTokens;
+      total.estimatedApiCostUsd += thread.estimatedApiCostUsd ?? 0;
+      if (thread.estimatedApiCostUsd !== null) total.pricedThreads += 1;
+      if (thread.pricingStatus !== 'exact-model-match') total.unknownPriceThreads += 1;
+      return total;
+    },
+    {
+      threads: 0,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      totalTokens: 0,
+      estimatedApiCostUsd: 0,
+      pricedThreads: 0,
+      unknownPriceThreads: 0
+    }
+  );
 }
 
 export function getLocalDailyUsage(days = 7): DailyUsage[] {
@@ -300,7 +446,7 @@ export function getLocalDailyUsage(days = 7): DailyUsage[] {
     SELECT date(observed_at, 'unixepoch', 'localtime') AS date,
            SUM(total_tokens) AS tokens,
            'local' AS source
-    FROM thread_token_events
+    FROM session_part_token_events
     WHERE observed_at >= ?
     GROUP BY date(observed_at, 'unixepoch', 'localtime')
     ORDER BY date ASC
@@ -314,19 +460,33 @@ export function getModelTokenEvents(since: number): Array<{
   totalTokens: number;
   estimatedApiCostUsd: number;
 }> {
-  const result = db.prepare(`
-    SELECT observed_at AS observedAt, model, total_tokens AS totalTokens,
-           COALESCE(estimated_cost_usd, 0) AS estimatedApiCostUsd
-    FROM thread_token_events
-    WHERE observed_at >= ?
-    ORDER BY observed_at ASC
-  `).all(since);
-  return rows<{
+  const primaryModels = new Map(buildThreadSummaries().map((thread) => [thread.threadId, thread.primaryModel]));
+  const result = rows<{
     observedAt: number;
+    threadId: string;
+    partKind: SessionPartKind;
     model: string;
     totalTokens: number;
     estimatedApiCostUsd: number;
-  }>(result);
+  }>(db.prepare(`
+    SELECT e.observed_at AS observedAt, e.thread_id AS threadId,
+           p.part_kind AS partKind, e.model, e.total_tokens AS totalTokens,
+           COALESCE(e.estimated_cost_usd, 0) AS estimatedApiCostUsd
+    FROM session_part_token_events e
+    JOIN session_parts p ON p.source_file = e.source_file
+    WHERE e.observed_at >= ?
+    ORDER BY e.observed_at ASC
+  `).all(since));
+
+  return result.map((event) => ({
+    observedAt: event.observedAt,
+    model:
+      event.partKind === 'reviewer' || event.model === 'codex-auto-review'
+        ? primaryModels.get(event.threadId) ?? event.model
+        : event.model,
+    totalTokens: event.totalTokens,
+    estimatedApiCostUsd: event.estimatedApiCostUsd
+  }));
 }
 
 export function emptyModelEfficiency(): ModelEfficiency[] {
