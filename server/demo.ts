@@ -1,4 +1,4 @@
-import type { DashboardOverview, ProjectionPoint, ThreadSummary } from './types.js';
+import type { DashboardOverview, ProjectionPoint, PromptMetric, ThreadSummary } from './types.js';
 
 const now = Math.floor(Date.now() / 1000);
 
@@ -9,10 +9,56 @@ function points(start: number, count: number, step: number, startValue: number, 
   }));
 }
 
+function demoPrompt(
+  promptId: string,
+  threadId: string,
+  sequence: number,
+  prompt: string,
+  model: string,
+  startedAt: number,
+  durationMs: number,
+  inputTokens: number,
+  cachedInputTokens: number,
+  outputTokens: number,
+  cost: number
+): PromptMetric {
+  return {
+    promptId,
+    sourceFile: 'demo',
+    threadId,
+    turnId: `turn-${promptId}`,
+    sequence,
+    prompt,
+    startedAt,
+    completedAt: startedAt + Math.round(durationMs / 1000),
+    durationMs,
+    timeToFirstTokenMs: 3_200,
+    timingEstimated: false,
+    primaryModel: model,
+    models: [model],
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens: Math.round(outputTokens * 0.35),
+    totalTokens: inputTokens + outputTokens,
+    estimatedApiCostUsd: cost,
+    pricingStatus: 'exact-model-match'
+  };
+}
+
+const threadOnePrompts = [
+  demoPrompt('demo-p1', 'demo-1', 1, 'Fix schedule import authentication and verify the worker flow.', 'gpt-5.6-sol', now - 7200, 1_160_000, 910_000, 760_000, 29_000, 2.3),
+  demoPrompt('demo-p2', 'demo-1', 2, 'Run the tests and fix the remaining mobile regression.', 'gpt-5.6-sol', now - 5100, 640_000, 550_000, 450_000, 13_000, 1.48)
+];
+const threadTwoPrompts = [
+  demoPrompt('demo-p3', 'demo-2', 1, 'Improve the mobile schedule grid and reduce horizontal overflow.', 'gpt-5.6-terra', now - 86_400, 780_000, 760_000, 640_000, 24_000, 1.02)
+];
+
 const threads: ThreadSummary[] = [
   {
     threadId: 'demo-1',
-    title: 'Fix schedule import authentication',
+    title: 'Schedule import authentication',
+    titleSource: 'codex-name',
     projectPath: 'C:\\Projects\\ScheduleShare',
     startedAt: now - 7200,
     updatedAt: now - 1800,
@@ -26,16 +72,21 @@ const threads: ThreadSummary[] = [
     estimatedApiCostUsd: 3.78,
     pricingStatus: 'partial',
     sourceFile: 'demo',
-    userMessageCount: 3,
-    reviewerTokens: 92_000,
-    partCount: 2
+    userMessageCount: 2,
+    reviewerTokens: 148_000,
+    partCount: 3,
+    prompts: threadOnePrompts,
+    estimatedFiveHourUsagePercent: 9.8,
+    estimatedSevenDayUsagePercent: 3.4,
+    usageSampleIntervals: 12
   },
   {
     threadId: 'demo-2',
-    title: 'Improve mobile schedule grid',
+    title: 'Cleaner mobile schedule grid',
+    titleSource: 'codex-name',
     projectPath: 'C:\\Projects\\ScheduleShare',
-    startedAt: now - 86400,
-    updatedAt: now - 82500,
+    startedAt: now - 86_400,
+    updatedAt: now - 82_500,
     primaryModel: 'gpt-5.6-terra',
     models: ['gpt-5.6-terra'],
     inputTokens: 760_000,
@@ -48,7 +99,11 @@ const threads: ThreadSummary[] = [
     sourceFile: 'demo',
     userMessageCount: 1,
     reviewerTokens: 0,
-    partCount: 1
+    partCount: 1,
+    prompts: threadTwoPrompts,
+    estimatedFiveHourUsagePercent: null,
+    estimatedSevenDayUsagePercent: 1.7,
+    usageSampleIntervals: 6
   }
 ];
 
@@ -134,6 +189,41 @@ export function demoOverview(): DashboardOverview {
         tokens: 784_000,
         estimatedApiCostUsd: 1.02,
         sampleIntervals: 11
+      }
+    ],
+    modelUsage: [
+      {
+        model: 'gpt-5.6-sol',
+        threads: 1,
+        inputTokens: 1_312_000,
+        cachedInputTokens: 1_095_000,
+        outputTokens: 42_000,
+        reasoningOutputTokens: 17_000,
+        totalTokens: 1_354_000,
+        estimatedApiCostUsd: 3.78,
+        pricingStatus: 'exact-model-match'
+      },
+      {
+        model: 'codex-auto-review',
+        threads: 1,
+        inputTokens: 145_000,
+        cachedInputTokens: 115_000,
+        outputTokens: 3_000,
+        reasoningOutputTokens: 1_000,
+        totalTokens: 148_000,
+        estimatedApiCostUsd: 0,
+        pricingStatus: 'unknown'
+      },
+      {
+        model: 'gpt-5.6-terra',
+        threads: 1,
+        inputTokens: 760_000,
+        cachedInputTokens: 640_000,
+        outputTokens: 24_000,
+        reasoningOutputTokens: 8_000,
+        totalTokens: 784_000,
+        estimatedApiCostUsd: 1.02,
+        pricingStatus: 'exact-model-match'
       }
     ],
     notices: ['Demo mode is enabled. Set DEMO_MODE=false to read your local Codex data.']

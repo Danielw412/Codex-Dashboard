@@ -1,6 +1,7 @@
 import {
   getModelTokenEvents,
-  getRateLimitHistory
+  getRateLimitHistory,
+  getThreadTokenEvents
 } from './db.js';
 import type {
   LimitProjection,
@@ -46,12 +47,12 @@ export function calculateProjection(
 
   const remainingSeconds = Math.max(0, current.resetsAt - now);
   const projected = current.usedPercent + fit.slopePerSecond * remainingSeconds;
-  const projectedExhaustionAt =
-    fit.slopePerSecond > 0
-      ? now + Math.round((100 - current.usedPercent) / fit.slopePerSecond)
-      : null;
-  const sustainableSlope =
-    remainingSeconds > 0 ? Math.max(0, 100 - current.usedPercent) / remainingSeconds : 0;
+  const projectedExhaustionAt = fit.slopePerSecond > 0
+    ? now + Math.round((100 - current.usedPercent) / fit.slopePerSecond)
+    : null;
+  const sustainableSlope = remainingSeconds > 0
+    ? Math.max(0, 100 - current.usedPercent) / remainingSeconds
+    : 0;
   const paceRatio = sustainableSlope > 0 ? fit.slopePerSecond / sustainableSlope : null;
   const confidence: LimitProjection['confidence'] =
     fit.spanSeconds >= recentWindow * 0.65 && recent.length >= 8
@@ -87,10 +88,7 @@ export function buildChartPoints(
   if (!nowPoint || nowPoint.timestamp !== current.observedAt) {
     points.push({ timestamp: current.observedAt, usedPercent: current.usedPercent });
   }
-  if (
-    projection.projectedExhaustionAt &&
-    projection.projectedExhaustionAt < current.resetsAt
-  ) {
+  if (projection.projectedExhaustionAt && projection.projectedExhaustionAt < current.resetsAt) {
     points.push({
       timestamp: projection.projectedExhaustionAt,
       usedPercent: 100,
@@ -113,7 +111,26 @@ interface EfficiencyAccumulator {
   sampleIntervals: number;
 }
 
-function assignInterval(
+function groupHistory(history: RateLimitWindow[]): RateLimitWindow[][] {
+  const groups = new Map<string, RateLimitWindow[]>();
+  for (const point of history) {
+    const key = `${point.key}:${point.resetsAt}`;
+    const group = groups.get(key) ?? [];
+    group.push(point);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map((group) =>
+    group
+      .sort((a, b) => a.observedAt - b.observedAt)
+      .filter((point, index, all) =>
+        index === 0 ||
+        point.observedAt !== all[index - 1].observedAt ||
+        point.usedPercent !== all[index - 1].usedPercent
+      )
+  );
+}
+
+function assignModelInterval(
   accumulators: Map<string, EfficiencyAccumulator>,
   events: ReturnType<typeof getModelTokenEvents>,
   deltaPercent: number,
@@ -155,21 +172,22 @@ export function calculateModelEfficiency(): ModelEfficiency[] {
   const history = fiveHourHistory.length >= 3 ? fiveHourHistory : sevenDayHistory;
   if (history.length < 2) return [];
 
-  const earliest = history[0].observedAt;
+  const earliest = Math.min(...history.map((point) => point.observedAt));
   const tokenEvents = getModelTokenEvents(earliest);
   const accumulators = new Map<string, EfficiencyAccumulator>();
 
-  for (let index = 1; index < history.length; index += 1) {
-    const previous = history[index - 1];
-    const current = history[index];
-    if (previous.resetsAt !== current.resetsAt || previous.key !== current.key) continue;
-    const delta = current.usedPercent - previous.usedPercent;
-    if (delta <= 0) continue;
-    const events = tokenEvents.filter(
-      (event) => event.observedAt > previous.observedAt && event.observedAt <= current.observedAt
-    );
-    const minutes = Math.min(10, Math.max(0.25, (current.observedAt - previous.observedAt) / 60));
-    assignInterval(accumulators, events, delta, minutes);
+  for (const group of groupHistory(history)) {
+    for (let index = 1; index < group.length; index += 1) {
+      const previous = group[index - 1];
+      const current = group[index];
+      const delta = current.usedPercent - previous.usedPercent;
+      if (delta <= 0) continue;
+      const events = tokenEvents.filter(
+        (event) => event.observedAt > previous.observedAt && event.observedAt <= current.observedAt
+      );
+      const minutes = Math.min(10, Math.max(0.25, (current.observedAt - previous.observedAt) / 60));
+      assignModelInterval(accumulators, events, delta, minutes);
+    }
   }
 
   return [...accumulators.entries()]
@@ -180,4 +198,74 @@ export function calculateModelEfficiency(): ModelEfficiency[] {
         row.estimatedUsagePercent > 0 ? row.activeMinutes / row.estimatedUsagePercent : null
     }))
     .sort((a, b) => b.estimatedUsagePercent - a.estimatedUsagePercent);
+}
+
+interface ThreadUsageAccumulator {
+  percent: number;
+  sampleIntervals: number;
+}
+
+function estimateThreadUsageForWindow(durationMins: number, lookbackDays: number): Map<string, ThreadUsageAccumulator> {
+  const history = getRateLimitHistory(durationMins, undefined, lookbackDays);
+  if (history.length < 2) return new Map();
+  const earliest = Math.min(...history.map((point) => point.observedAt));
+  const tokenEvents = getThreadTokenEvents(earliest);
+  const accumulators = new Map<string, ThreadUsageAccumulator>();
+
+  for (const group of groupHistory(history)) {
+    for (let index = 1; index < group.length; index += 1) {
+      const previous = group[index - 1];
+      const current = group[index];
+      const delta = current.usedPercent - previous.usedPercent;
+      if (delta <= 0) continue;
+      const events = tokenEvents.filter(
+        (event) => event.observedAt > previous.observedAt && event.observedAt <= current.observedAt
+      );
+      if (events.length === 0) continue;
+
+      const byThread = new Map<string, { tokens: number; cost: number }>();
+      for (const event of events) {
+        const row = byThread.get(event.threadId) ?? { tokens: 0, cost: 0 };
+        row.tokens += event.totalTokens;
+        row.cost += event.estimatedApiCostUsd;
+        byThread.set(event.threadId, row);
+      }
+      const totalCost = [...byThread.values()].reduce((sum, row) => sum + row.cost, 0);
+      const totalTokens = [...byThread.values()].reduce((sum, row) => sum + row.tokens, 0);
+      for (const [threadId, row] of byThread) {
+        const weight = totalCost > 0
+          ? row.cost / totalCost
+          : totalTokens > 0
+            ? row.tokens / totalTokens
+            : 0;
+        if (weight <= 0) continue;
+        const accumulator = accumulators.get(threadId) ?? { percent: 0, sampleIntervals: 0 };
+        accumulator.percent += delta * weight;
+        accumulator.sampleIntervals += 1;
+        accumulators.set(threadId, accumulator);
+      }
+    }
+  }
+  return accumulators;
+}
+
+export function calculateThreadUsageEstimates(): Map<string, {
+  fiveHourPercent: number | null;
+  sevenDayPercent: number | null;
+  sampleIntervals: number;
+}> {
+  const fiveHour = estimateThreadUsageForWindow(300, 8);
+  const sevenDay = estimateThreadUsageForWindow(10_080, 15);
+  const ids = new Set([...fiveHour.keys(), ...sevenDay.keys()]);
+  return new Map(
+    [...ids].map((threadId) => {
+      const short = fiveHour.get(threadId);
+      const weekly = sevenDay.get(threadId);
+      return [threadId, {
+        fiveHourPercent: short?.percent ?? null,
+        sevenDayPercent: weekly?.percent ?? null,
+        sampleIntervals: Math.max(short?.sampleIntervals ?? 0, weekly?.sampleIntervals ?? 0)
+      }];
+    })
+  );
 }

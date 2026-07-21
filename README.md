@@ -11,7 +11,11 @@ The dashboard runs entirely on your computer. It starts `codex app-server`, read
 - Graceful handling when Codex does not report a 5-hour window. The card shows **Not reported** while older history remains stored.
 - Graphs for the active 5-hour and 7-day quota windows.
 - Daily token activity for the last seven days.
-- Per-thread model, input tokens, cached input tokens, output tokens, total tokens, and estimated API-equivalent cost.
+- Per-thread model, total tokens, cached/uncached input, output, reasoning output, and estimated API-equivalent cost.
+- Estimated 5-hour and 7-day quota consumed by each thread, based on overlapping quota and token snapshots.
+- User-facing Codex thread names when App Server reports them, with the first cleaned prompt as a fallback.
+- Expandable thread details with prompt-level token use, timing, first-token latency, cache use, model, and estimated cost.
+- Separate model graphs for total tokens and API-equivalent cost.
 - Total indexed tokens and total API-equivalent cost.
 - Estimated minutes per 1% of quota for each model.
 - Accuracy notes that distinguish direct Codex data from calculated estimates.
@@ -87,6 +91,7 @@ Copy `.env.example` to `.env`. Supported values:
 | `CODEX_HOME` | `~/.codex` | Folder containing Codex sessions and archived sessions. |
 | `RATE_LIMIT_POLL_MS` | `60000` | Account quota polling interval. |
 | `ACCOUNT_USAGE_POLL_MS` | `900000` | Account daily-token summary polling interval. |
+| `THREAD_METADATA_POLL_MS` | `900000` | App Server thread-name and preview refresh interval. |
 | `SESSION_SCAN_MS` | `120000` | Local session-log scan interval. |
 | `DEMO_MODE` | `false` | Use generated sample data. |
 | `PORT` | `8787` | Backend and production-web port. |
@@ -118,7 +123,8 @@ codex-usage-dashboard/
 ├─ src/
 │  ├─ App.tsx                   Dashboard components and charts
 │  ├─ api.ts                    Frontend API calls
-│  ├─ styles.css                Design system and responsive layout
+│  ├─ styles.css                Core design system and responsive layout
+│  ├─ analytics.css             Expandable thread and model-chart styles
 │  └─ types.ts                  Frontend data types
 ├─ .env.example
 ├─ package.json
@@ -173,9 +179,29 @@ The session scanner reads JSONL files under:
 ~/.codex/archived_sessions
 ```
 
-It looks for incremental token-usage events, model metadata, timestamps, working directory, thread ID, and the first user prompt. This parser is intentionally isolated in `server/sessionLogs.ts` because local log formats can change.
+It looks for incremental token-usage events, model metadata, timestamps, working directory, thread ID, user prompts, task start/completion events, and embedded rate-limit snapshots. This parser is intentionally isolated in `server/sessionLogs.ts` because local log formats can change.
 
-The parser can recover prior usage only when the corresponding local session files still exist and contain incremental usage records. It does not invent missing tokens. A thread whose model cannot be matched to `config/pricing.json` remains visible, but its price is excluded from the total.
+The backend also calls App Server `thread/list` for persisted thread metadata. When Codex reports a user-facing thread name, the dashboard uses it. If no name is available, it uses the App Server preview and then the first cleaned prompt as fallbacks.
+
+Each normal thread is grouped with its reviewer/guardian session parts. The main Sol/Terra model remains the displayed primary model, while auto-review tokens are shown as review overhead.
+
+The parser can recover prior usage only when the corresponding local session files still exist and contain usable records. It does not invent missing tokens. A thread whose model cannot be matched to `config/pricing.json` remains visible, but its price is excluded from the total.
+
+### Per-thread usage and prompt metrics
+
+Codex does not directly provide an exact “this thread used X% of the quota” value. The dashboard estimates thread-level 5-hour and 7-day usage by comparing adjacent quota snapshots and assigning each positive percentage change to token events observed in the same interval. API-equivalent cost is used as the weighting when available, with token count as the fallback.
+
+Expanded thread rows show prompt segments recovered from local logs. Timing is labeled by quality:
+
+- **Exact** when Codex reports a task duration or first-token latency.
+- **Derived** when duration is calculated from logged prompt, task, and completion timestamps.
+- **Unavailable** when the required events were not persisted.
+
+Steering messages sent while a task is already running are treated as separate prompts when the rollout log preserves them. Token events are assigned to the active prompt segment on a best-effort basis.
+
+### Model token and cost graphs
+
+The model token graph sums input and output token events by the model recorded for each request. The cost graph sums the API-equivalent estimate for those same events. Auto-review remains a separate model category in these graphs so its overhead is visible, even though it is grouped under the parent thread in the thread table.
 
 ### API-equivalent cost
 
@@ -202,9 +228,11 @@ When multiple models were active in one interval, the quota change is divided us
 
 ## Accuracy limits
 
-- No application can reconstruct old quota-percentage snapshots that were never recorded. Historical quota graphs begin when this dashboard starts collecting data.
+- Historical quota points can be recovered from older rollout logs when those logs contain rate-limit snapshots. Gaps that were never logged cannot be reconstructed.
 - `account/usage/read` may provide older daily token buckets, depending on the account and authentication mode.
-- A separate dashboard does not automatically receive every live per-thread event from another Codex client, so local session logs are used for thread accounting.
+- A separate dashboard does not automatically receive every live per-thread event from another Codex client, so local session logs are used for thread and prompt accounting.
+- Thread-level quota percentages and per-prompt token attribution are estimates, not values directly reported by Codex.
+- User-facing thread names depend on App Server metadata. A prompt-derived fallback is shown when no persisted name is returned.
 - Token totals do not convert directly into ChatGPT quota percentage. Model, caching, reasoning, tools, images, and Codex service accounting can affect quota use.
 - API-equivalent prices can become outdated. Review `config/pricing.json` after model or pricing changes.
 

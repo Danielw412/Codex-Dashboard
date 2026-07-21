@@ -12,7 +12,13 @@ import {
   Zap
 } from 'lucide-react';
 import { getOverview, refreshOverview } from './api';
-import { DailyTokenChart, ModelEfficiencyChart, RateLimitChart } from './components/Charts';
+import {
+  DailyTokenChart,
+  ModelCostChart,
+  ModelEfficiencyChart,
+  ModelTokenChart,
+  RateLimitChart
+} from './components/Charts';
 import { LimitCard } from './components/LimitCard';
 import { ThreadsTable } from './components/ThreadsTable';
 import type { DashboardOverview } from './types';
@@ -251,6 +257,11 @@ export default function App() {
         <div className="secondary-grid">
           <DailyTokenChart data={dailyData} />
           <ModelEfficiencyChart data={overview.modelEfficiency} />
+        </div>
+
+        <div className="model-charts-grid">
+          <ModelTokenChart data={overview.modelUsage} />
+          <ModelCostChart data={overview.modelUsage} />
         </div>
 
         <ThreadsTable threads={overview.threads} />
