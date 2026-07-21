@@ -46,6 +46,9 @@ export interface ThreadSummary extends TokenUsage {
   estimatedApiCostUsd: number | null;
   pricingStatus: 'exact-model-match' | 'partial' | 'unknown';
   sourceFile: string;
+  userMessageCount: number;
+  reviewerTokens: number;
+  partCount: number;
 }
 
 export interface ModelEfficiency {
