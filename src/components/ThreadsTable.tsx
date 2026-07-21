@@ -182,11 +182,11 @@ function ExpandedThread({ thread }: { thread: ThreadSummary }) {
         />
         <div className="usage-detail-card">
           <div>
-            <span>Estimated 5-hour usage</span>
+            <span>Estimated 5-hour bank usage</span>
             <strong>{formatUsage(thread.estimatedFiveHourUsagePercent)}</strong>
           </div>
           <div>
-            <span>Estimated 7-day usage</span>
+            <span>Estimated 7-day bank usage</span>
             <strong>{formatUsage(thread.estimatedSevenDayUsagePercent)}</strong>
           </div>
           <div>
@@ -198,7 +198,7 @@ function ExpandedThread({ thread }: { thread: ThreadSummary }) {
             <strong>{thread.partCount}</strong>
           </div>
           <p>
-            Quota percentages are estimates based on quota movement and local token events during the same intervals.
+            Each percentage applies only to the quota bank active at the thread’s latest token event. Missing or inconsistent snapshot coverage is left blank.
           </p>
         </div>
       </div>
@@ -241,7 +241,7 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
           <p className="eyebrow">Local history</p>
           <h2>Threads</h2>
           <p className="panel-subtitle">
-            Expand a thread for token distribution, estimated quota use, and prompt-level timing.
+            Expand a thread for token distribution, per-bank quota estimates, and prompt-level timing.
           </p>
         </div>
       </div>
@@ -302,9 +302,15 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
                       </td>
                       <td className="numeric-cell">
                         {formatUsage(thread.estimatedSevenDayUsagePercent)}
-                        <span className="sub-value">7-day window</span>
+                        <span className="sub-value">
+                          {thread.estimatedSevenDayUsagePercent === null
+                            ? 'Not enough logged samples'
+                            : '7-day bank at last activity'}
+                        </span>
                         {thread.estimatedFiveHourUsagePercent !== null && (
-                          <span className="sub-value">{formatUsage(thread.estimatedFiveHourUsagePercent)} in 5-hour</span>
+                          <span className="sub-value">
+                            {formatUsage(thread.estimatedFiveHourUsagePercent)} in 5-hour bank
+                          </span>
                         )}
                       </td>
                       <td className="numeric-cell">
