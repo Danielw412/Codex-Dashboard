@@ -4,7 +4,6 @@ import {
   BarChart,
   CartesianGrid,
   ComposedChart,
-  Legend,
   Line,
   ReferenceLine,
   ResponsiveContainer,
@@ -12,7 +11,12 @@ import {
   XAxis,
   YAxis
 } from 'recharts';
-import type { DailyUsage, ModelEfficiency, ProjectionPoint } from '../types';
+import type {
+  DailyUsage,
+  ModelEfficiency,
+  ModelUsageSummary,
+  ProjectionPoint
+} from '../types';
 
 function compactNumber(value: number): string {
   return new Intl.NumberFormat('en-US', {
@@ -40,6 +44,13 @@ function buildTrendData(points: ProjectionPoint[]): TrendRow[] {
     projection: point.projected ? point.usedPercent : null
   }));
 }
+
+const tooltipStyle = {
+  background: 'var(--tooltip-bg)',
+  border: '1px solid var(--border-strong)',
+  borderRadius: 12,
+  boxShadow: 'var(--shadow-lg)'
+};
 
 export function RateLimitChart({
   title,
@@ -101,12 +112,7 @@ export function RateLimitChart({
                 tickLine={false}
               />
               <Tooltip
-                contentStyle={{
-                  background: 'var(--tooltip-bg)',
-                  border: '1px solid var(--border-strong)',
-                  borderRadius: 12,
-                  boxShadow: 'var(--shadow-lg)'
-                }}
+                contentStyle={tooltipStyle}
                 labelFormatter={(value) => new Date(Number(value) * 1000).toLocaleString()}
                 formatter={(value, name) => [
                   `${Number(value).toFixed(1)}%`,
@@ -175,11 +181,7 @@ export function DailyTokenChart({ data }: { data: DailyUsage[] }) {
               />
               <Tooltip
                 cursor={{ fill: 'var(--hover-surface)' }}
-                contentStyle={{
-                  background: 'var(--tooltip-bg)',
-                  border: '1px solid var(--border-strong)',
-                  borderRadius: 12
-                }}
+                contentStyle={tooltipStyle}
                 formatter={(value) => [Number(value).toLocaleString(), 'Tokens']}
               />
               <Bar dataKey="tokens" fill="var(--chart-secondary)" radius={[6, 6, 2, 2]} />
@@ -193,11 +195,9 @@ export function DailyTokenChart({ data }: { data: DailyUsage[] }) {
 
 export function ModelEfficiencyChart({ data }: { data: ModelEfficiency[] }) {
   const chartData = data.filter((row) => row.minutesPerPercent !== null).slice(0, 8);
-  const average =
-    chartData.length > 0
-      ? chartData.reduce((sum, row) => sum + (row.minutesPerPercent ?? 0), 0) /
-        chartData.length
-      : null;
+  const average = chartData.length > 0
+    ? chartData.reduce((sum, row) => sum + (row.minutesPerPercent ?? 0), 0) / chartData.length
+    : null;
 
   return (
     <section className="panel chart-panel efficiency-panel">
@@ -205,9 +205,7 @@ export function ModelEfficiencyChart({ data }: { data: ModelEfficiency[] }) {
         <div>
           <p className="eyebrow">Estimated model efficiency</p>
           <h2>Minutes per 1% of quota</h2>
-          <p className="panel-subtitle">
-            Higher means the model consumed the observed quota more slowly.
-          </p>
+          <p className="panel-subtitle">Higher means the model consumed the observed quota more slowly.</p>
         </div>
         {average !== null && (
           <div className="average-box">
@@ -240,21 +238,110 @@ export function ModelEfficiencyChart({ data }: { data: ModelEfficiency[] }) {
               />
               <Tooltip
                 cursor={{ fill: 'var(--hover-surface)' }}
-                contentStyle={{
-                  background: 'var(--tooltip-bg)',
-                  border: '1px solid var(--border-strong)',
-                  borderRadius: 12
-                }}
+                contentStyle={tooltipStyle}
                 formatter={(value) => [`${Number(value).toFixed(2)} minutes`, 'Per 1%']}
               />
               {average !== null && (
                 <ReferenceLine x={average} stroke="var(--chart-projection)" strokeDasharray="4 4" />
               )}
-              <Bar
-                dataKey="minutesPerPercent"
-                fill="var(--chart-tertiary)"
-                radius={[0, 6, 6, 0]}
+              <Bar dataKey="minutesPerPercent" fill="var(--chart-tertiary)" radius={[0, 6, 6, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function ModelTokenChart({ data }: { data: ModelUsageSummary[] }) {
+  const chartData = [...data].sort((a, b) => b.totalTokens - a.totalTokens).slice(0, 10);
+  return (
+    <section className="panel chart-panel model-breakdown-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">Model totals</p>
+          <h2>Tokens by model</h2>
+          <p className="panel-subtitle">Includes main-agent, subagent, and auto-review token events.</p>
+        </div>
+      </div>
+      {chartData.length === 0 ? (
+        <div className="chart-empty">No model token data has been indexed.</div>
+      ) : (
+        <div className="chart-frame model-chart">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 24, bottom: 0, left: 38 }}>
+              <CartesianGrid stroke="var(--grid-line)" horizontal={false} />
+              <XAxis
+                type="number"
+                tickFormatter={compactNumber}
+                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                axisLine={false}
+                tickLine={false}
               />
+              <YAxis
+                type="category"
+                dataKey="model"
+                width={130}
+                tick={{ fill: 'var(--text-secondary)', fontSize: 10 }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <Tooltip
+                cursor={{ fill: 'var(--hover-surface)' }}
+                contentStyle={tooltipStyle}
+                formatter={(value) => [Number(value).toLocaleString(), 'Tokens']}
+              />
+              <Bar dataKey="totalTokens" fill="var(--chart-secondary)" radius={[0, 6, 6, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function ModelCostChart({ data }: { data: ModelUsageSummary[] }) {
+  const chartData = data
+    .filter((row) => row.estimatedApiCostUsd > 0)
+    .sort((a, b) => b.estimatedApiCostUsd - a.estimatedApiCostUsd)
+    .slice(0, 10);
+  return (
+    <section className="panel chart-panel model-breakdown-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="eyebrow">API-equivalent pricing</p>
+          <h2>Estimated cost by model</h2>
+          <p className="panel-subtitle">Unpriced internal models are omitted from this graph.</p>
+        </div>
+      </div>
+      {chartData.length === 0 ? (
+        <div className="chart-empty">No model has a matched API price yet.</div>
+      ) : (
+        <div className="chart-frame model-chart">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 24, bottom: 0, left: 38 }}>
+              <CartesianGrid stroke="var(--grid-line)" horizontal={false} />
+              <XAxis
+                type="number"
+                tickFormatter={(value) => `$${Number(value).toFixed(2)}`}
+                tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <YAxis
+                type="category"
+                dataKey="model"
+                width={130}
+                tick={{ fill: 'var(--text-secondary)', fontSize: 10 }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <Tooltip
+                cursor={{ fill: 'var(--hover-surface)' }}
+                contentStyle={tooltipStyle}
+                formatter={(value) => [`$${Number(value).toFixed(4)}`, 'API equivalent']}
+              />
+              <Bar dataKey="estimatedApiCostUsd" fill="var(--chart-tertiary)" radius={[0, 6, 6, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </div>
