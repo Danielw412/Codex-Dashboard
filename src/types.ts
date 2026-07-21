@@ -35,20 +35,46 @@ export interface DailyUsage {
   source: 'account' | 'local';
 }
 
+export type PricingStatus = 'exact-model-match' | 'partial' | 'unknown';
+export type TitleSource = 'codex-name' | 'codex-preview' | 'prompt' | 'fallback';
+
+export interface PromptMetric extends TokenUsage {
+  promptId: string;
+  sourceFile: string;
+  threadId: string;
+  turnId: string | null;
+  sequence: number;
+  prompt: string;
+  startedAt: number;
+  completedAt: number | null;
+  durationMs: number | null;
+  timeToFirstTokenMs: number | null;
+  timingEstimated: boolean;
+  primaryModel: string;
+  models: string[];
+  estimatedApiCostUsd: number | null;
+  pricingStatus: PricingStatus;
+}
+
 export interface ThreadSummary extends TokenUsage {
   threadId: string;
   title: string;
+  titleSource: TitleSource;
   projectPath: string | null;
   startedAt: number | null;
   updatedAt: number | null;
   primaryModel: string;
   models: string[];
   estimatedApiCostUsd: number | null;
-  pricingStatus: 'exact-model-match' | 'partial' | 'unknown';
+  pricingStatus: PricingStatus;
   sourceFile: string;
   userMessageCount: number;
   reviewerTokens: number;
   partCount: number;
+  prompts: PromptMetric[];
+  estimatedFiveHourUsagePercent: number | null;
+  estimatedSevenDayUsagePercent: number | null;
+  usageSampleIntervals: number;
 }
 
 export interface ModelEfficiency {
@@ -59,6 +85,13 @@ export interface ModelEfficiency {
   tokens: number;
   estimatedApiCostUsd: number;
   sampleIntervals: number;
+}
+
+export interface ModelUsageSummary extends TokenUsage {
+  model: string;
+  threads: number;
+  estimatedApiCostUsd: number;
+  pricingStatus: PricingStatus;
 }
 
 export interface DashboardOverview {
@@ -93,5 +126,6 @@ export interface DashboardOverview {
   };
   threads: ThreadSummary[];
   modelEfficiency: ModelEfficiency[];
+  modelUsage: ModelUsageSummary[];
   notices: string[];
 }
