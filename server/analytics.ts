@@ -166,31 +166,94 @@ function assignModelInterval(
   }
 }
 
-export function calculateModelEfficiency(): ModelEfficiency[] {
-  const fiveHourHistory = getRateLimitHistory(300, undefined, 8);
-  const sevenDayHistory = getRateLimitHistory(10_080, undefined, 8);
-  const history = fiveHourHistory.length >= 3 ? fiveHourHistory : sevenDayHistory;
-  if (history.length < 2) return [];
+type ModelTokenEvent = ReturnType<typeof getModelTokenEvents>[number];
 
-  const earliest = Math.min(...history.map((point) => point.observedAt));
-  const tokenEvents = getModelTokenEvents(earliest);
-  const accumulators = new Map<string, EfficiencyAccumulator>();
+function addEfficiencyRows(
+  target: Map<string, EfficiencyAccumulator>,
+  source: Map<string, EfficiencyAccumulator>
+): void {
+  for (const [model, row] of source) {
+    const accumulator = target.get(model) ?? {
+      estimatedUsagePercent: 0,
+      activeMinutes: 0,
+      tokens: 0,
+      estimatedApiCostUsd: 0,
+      sampleIntervals: 0
+    };
+    accumulator.estimatedUsagePercent += row.estimatedUsagePercent;
+    accumulator.activeMinutes += row.activeMinutes;
+    accumulator.tokens += row.tokens;
+    accumulator.estimatedApiCostUsd += row.estimatedApiCostUsd;
+    accumulator.sampleIntervals += row.sampleIntervals;
+    target.set(model, accumulator);
+  }
+}
 
-  for (const group of groupHistory(history)) {
+function estimateModelEfficiencyForHistory(
+  history: RateLimitWindow[],
+  lookbackDays: number
+): ModelEfficiency[] {
+  if (history.length === 0) return [];
+
+  const preferredKey = Math.abs(history[0].windowDurationMins - 300) <= 5
+    ? 'five-hour'
+    : Math.abs(history[0].windowDurationMins - 10_080) <= 60
+      ? 'seven-day'
+      : null;
+  const latest = preferredKey
+    ? [...history].reverse().find((point) => point.key === preferredKey) ?? history.at(-1)!
+    : history.at(-1)!;
+  const matchingHistory = history.filter((point) => point.key === latest.key);
+  const groups = groupHistory(matchingHistory);
+  if (groups.length === 0) return [];
+
+  const durationSeconds = latest.windowDurationMins * 60;
+  const earliestBankStart = Math.max(
+    Math.floor(Date.now() / 1000) - lookbackDays * 86400,
+    Math.min(...groups.map((group) => group[0].resetsAt - durationSeconds))
+  );
+  const tokenEvents = getModelTokenEvents(earliestBankStart);
+  const reliableTotals = new Map<string, EfficiencyAccumulator>();
+
+  for (const group of groups) {
+    if (group.length < 2) continue;
+
+    const resetAt = group[0].resetsAt;
+    const bankStart = resetAt - durationSeconds;
+    const bankEvents = tokenEvents.filter(
+      (event) => event.observedAt >= bankStart && event.observedAt < resetAt
+    );
+    if (bankEvents.length === 0) continue;
+
+    const bankTotals = new Map<string, EfficiencyAccumulator>();
+    const coveredEvents = new Set<ModelTokenEvent>();
+    let bankIsConsistent = true;
+
     for (let index = 1; index < group.length; index += 1) {
       const previous = group[index - 1];
       const current = group[index];
       const delta = current.usedPercent - previous.usedPercent;
-      if (delta <= 0) continue;
-      const events = tokenEvents.filter(
+
+      if (delta < -0.01) {
+        bankIsConsistent = false;
+        break;
+      }
+
+      const events = bankEvents.filter(
         (event) => event.observedAt > previous.observedAt && event.observedAt <= current.observedAt
       );
+      if (events.length === 0 || delta <= 0) continue;
+
       const minutes = Math.min(10, Math.max(0.25, (current.observedAt - previous.observedAt) / 60));
-      assignModelInterval(accumulators, events, delta, minutes);
+      assignModelInterval(bankTotals, events, delta, minutes);
+      for (const event of events) coveredEvents.add(event);
     }
+
+    if (!bankIsConsistent || !bankEvents.every((event) => coveredEvents.has(event))) continue;
+    addEfficiencyRows(reliableTotals, bankTotals);
   }
 
-  return [...accumulators.entries()]
+  return [...reliableTotals.entries()]
     .map(([model, row]) => ({
       model,
       ...row,
@@ -198,6 +261,15 @@ export function calculateModelEfficiency(): ModelEfficiency[] {
         row.estimatedUsagePercent > 0 ? row.activeMinutes / row.estimatedUsagePercent : null
     }))
     .sort((a, b) => b.estimatedUsagePercent - a.estimatedUsagePercent);
+}
+
+export function calculateModelEfficiency(): ModelEfficiency[] {
+  const fiveHourHistory = getRateLimitHistory(300, undefined, 15);
+  const fiveHour = estimateModelEfficiencyForHistory(fiveHourHistory, 15);
+  if (fiveHour.length > 0) return fiveHour;
+
+  const sevenDayHistory = getRateLimitHistory(10_080, undefined, 30);
+  return estimateModelEfficiencyForHistory(sevenDayHistory, 30);
 }
 
 interface ThreadUsageAccumulator {
