@@ -4,10 +4,14 @@ import { DatabaseSync } from 'node:sqlite';
 import type {
   DailyUsage,
   ModelEfficiency,
+  ModelUsageSummary,
+  PricingStatus,
+  PromptMetric,
   RateLimitWindow,
   SessionPartKind,
   ThreadPartSummary,
   ThreadSummary,
+  TitleSource,
   TokenUsage
 } from './types.js';
 
@@ -79,6 +83,39 @@ db.exec(`
     ON session_part_token_events(observed_at);
   CREATE INDEX IF NOT EXISTS idx_session_part_events_thread
     ON session_part_token_events(thread_id, observed_at);
+
+  CREATE TABLE IF NOT EXISTS prompt_metrics (
+    prompt_id TEXT PRIMARY KEY,
+    source_file TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT,
+    sequence_number INTEGER NOT NULL,
+    prompt_text TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    duration_ms INTEGER,
+    time_to_first_token_ms INTEGER,
+    timing_estimated INTEGER NOT NULL,
+    primary_model TEXT NOT NULL,
+    models_json TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    cached_input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    reasoning_output_tokens INTEGER NOT NULL,
+    total_tokens INTEGER NOT NULL,
+    estimated_cost_usd REAL,
+    pricing_status TEXT NOT NULL,
+    FOREIGN KEY(source_file) REFERENCES session_parts(source_file) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_prompt_metrics_thread
+    ON prompt_metrics(thread_id, started_at);
+
+  CREATE TABLE IF NOT EXISTS thread_metadata (
+    thread_id TEXT PRIMARY KEY,
+    display_name TEXT,
+    preview TEXT,
+    updated_at INTEGER NOT NULL
+  );
 `);
 
 function rows<T>(value: unknown): T[] {
@@ -179,6 +216,7 @@ export function getSessionFileState(sourceFile: string): {
 export function replaceThreadData(
   summary: ThreadPartSummary,
   events: StoredThreadEvent[],
+  prompts: PromptMetric[],
   fileState: { modifiedMs: number; sizeBytes: number }
 ): void {
   const upsertPart = db.prepare(`
@@ -216,6 +254,15 @@ export function replaceThreadData(
       total_tokens, estimated_cost_usd
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const insertPrompt = db.prepare(`
+    INSERT INTO prompt_metrics (
+      prompt_id, source_file, thread_id, turn_id, sequence_number, prompt_text,
+      started_at, completed_at, duration_ms, time_to_first_token_ms,
+      timing_estimated, primary_model, models_json, input_tokens,
+      cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+      estimated_cost_usd, pricing_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
   db.exec('BEGIN IMMEDIATE;');
   try {
@@ -241,6 +288,7 @@ export function replaceThreadData(
       summary.userMessageCount
     );
     db.prepare('DELETE FROM session_part_token_events WHERE source_file = ?').run(summary.sourceFile);
+    db.prepare('DELETE FROM prompt_metrics WHERE source_file = ?').run(summary.sourceFile);
     for (const event of events) {
       insertEvent.run(
         event.eventKey,
@@ -255,6 +303,56 @@ export function replaceThreadData(
         event.totalTokens,
         event.estimatedApiCostUsd
       );
+    }
+    for (const prompt of prompts) {
+      insertPrompt.run(
+        prompt.promptId,
+        prompt.sourceFile,
+        prompt.threadId,
+        prompt.turnId,
+        prompt.sequence,
+        prompt.prompt,
+        prompt.startedAt,
+        prompt.completedAt,
+        prompt.durationMs,
+        prompt.timeToFirstTokenMs,
+        prompt.timingEstimated ? 1 : 0,
+        prompt.primaryModel,
+        JSON.stringify(prompt.models),
+        prompt.inputTokens,
+        prompt.cachedInputTokens,
+        prompt.outputTokens,
+        prompt.reasoningOutputTokens,
+        prompt.totalTokens,
+        prompt.estimatedApiCostUsd,
+        prompt.pricingStatus
+      );
+    }
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+}
+
+export function upsertThreadMetadata(items: Array<{
+  threadId: string;
+  displayName: string | null;
+  preview: string | null;
+  updatedAt: number;
+}>): void {
+  const statement = db.prepare(`
+    INSERT INTO thread_metadata (thread_id, display_name, preview, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(thread_id) DO UPDATE SET
+      display_name = COALESCE(excluded.display_name, thread_metadata.display_name),
+      preview = COALESCE(excluded.preview, thread_metadata.preview),
+      updated_at = MAX(excluded.updated_at, thread_metadata.updated_at)
+  `);
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    for (const item of items) {
+      statement.run(item.threadId, item.displayName, item.preview, item.updatedAt);
     }
     db.exec('COMMIT;');
   } catch (error) {
@@ -274,7 +372,7 @@ interface PartRow extends TokenUsage {
   primaryModel: string;
   modelsJson: string;
   estimatedApiCostUsd: number | null;
-  pricingStatus: ThreadSummary['pricingStatus'];
+  pricingStatus: PricingStatus;
   userMessageCount: number;
 }
 
@@ -282,6 +380,58 @@ interface ModelTokenRow {
   threadId: string;
   model: string;
   totalTokens: number;
+}
+
+interface MetadataRow {
+  threadId: string;
+  displayName: string | null;
+  preview: string | null;
+}
+
+interface PromptRow extends TokenUsage {
+  promptId: string;
+  sourceFile: string;
+  threadId: string;
+  turnId: string | null;
+  sequence: number;
+  prompt: string;
+  startedAt: number;
+  completedAt: number | null;
+  durationMs: number | null;
+  timeToFirstTokenMs: number | null;
+  timingEstimated: number;
+  primaryModel: string;
+  modelsJson: string;
+  estimatedApiCostUsd: number | null;
+  pricingStatus: PricingStatus;
+}
+
+function getPromptMap(): Map<string, PromptMetric[]> {
+  const promptRows = rows<PromptRow>(db.prepare(`
+    SELECT prompt_id AS promptId, source_file AS sourceFile, thread_id AS threadId,
+           turn_id AS turnId, sequence_number AS sequence, prompt_text AS prompt,
+           started_at AS startedAt, completed_at AS completedAt,
+           duration_ms AS durationMs, time_to_first_token_ms AS timeToFirstTokenMs,
+           timing_estimated AS timingEstimated, primary_model AS primaryModel,
+           models_json AS modelsJson, input_tokens AS inputTokens,
+           cached_input_tokens AS cachedInputTokens, output_tokens AS outputTokens,
+           reasoning_output_tokens AS reasoningOutputTokens, total_tokens AS totalTokens,
+           estimated_cost_usd AS estimatedApiCostUsd, pricing_status AS pricingStatus
+    FROM prompt_metrics
+    ORDER BY started_at ASC, sequence_number ASC
+  `).all());
+  const map = new Map<string, PromptMetric[]>();
+  for (const row of promptRows) {
+    const item: PromptMetric = {
+      ...row,
+      timingEstimated: Boolean(row.timingEstimated),
+      models: JSON.parse(row.modelsJson) as string[]
+    };
+    const list = map.get(row.threadId) ?? [];
+    list.push(item);
+    map.set(row.threadId, list);
+  }
+  return map;
 }
 
 function buildThreadSummaries(): ThreadSummary[] {
@@ -297,6 +447,14 @@ function buildThreadSummaries(): ThreadSummary[] {
     FROM session_parts
     ORDER BY COALESCE(started_at, updated_at, 0) ASC
   `).all());
+
+  const metadata = new Map(
+    rows<MetadataRow>(db.prepare(`
+      SELECT thread_id AS threadId, display_name AS displayName, preview
+      FROM thread_metadata
+    `).all()).map((row) => [row.threadId, row])
+  );
+  const promptMap = getPromptMap();
 
   const mainModelTokens = rows<ModelTokenRow>(db.prepare(`
     SELECT e.thread_id AS threadId, e.model, SUM(e.total_tokens) AS totalTokens
@@ -320,6 +478,7 @@ function buildThreadSummaries(): ThreadSummary[] {
       thread = {
         threadId: part.threadId,
         title: part.partKind === 'main' && part.title ? part.title : 'Untitled Codex thread',
+        titleSource: part.partKind === 'main' && part.title ? 'prompt' : 'fallback',
         projectPath: part.partKind === 'main' ? part.projectPath : null,
         startedAt: part.startedAt,
         updatedAt: part.updatedAt,
@@ -336,6 +495,10 @@ function buildThreadSummaries(): ThreadSummary[] {
         userMessageCount: 0,
         reviewerTokens: 0,
         partCount: 0,
+        prompts: [],
+        estimatedFiveHourUsagePercent: null,
+        estimatedSevenDayUsagePercent: null,
+        usageSampleIntervals: 0,
         hasPriced: false,
         hasUnpriced: false
       };
@@ -343,7 +506,10 @@ function buildThreadSummaries(): ThreadSummary[] {
     }
 
     if (part.partKind === 'main') {
-      if (thread.title === 'Untitled Codex thread' && part.title) thread.title = part.title;
+      if (thread.titleSource === 'fallback' && part.title) {
+        thread.title = part.title;
+        thread.titleSource = 'prompt';
+      }
       if (!thread.projectPath && part.projectPath) thread.projectPath = part.projectPath;
       if (thread.primaryModel === 'unknown' && part.primaryModel !== 'unknown') {
         thread.primaryModel = part.primaryModel;
@@ -352,18 +518,16 @@ function buildThreadSummaries(): ThreadSummary[] {
       thread.userMessageCount += part.userMessageCount;
     }
 
-    thread.startedAt =
-      thread.startedAt === null
-        ? part.startedAt
-        : part.startedAt === null
-          ? thread.startedAt
-          : Math.min(thread.startedAt, part.startedAt);
-    thread.updatedAt =
-      thread.updatedAt === null
-        ? part.updatedAt
-        : part.updatedAt === null
-          ? thread.updatedAt
-          : Math.max(thread.updatedAt, part.updatedAt);
+    thread.startedAt = thread.startedAt === null
+      ? part.startedAt
+      : part.startedAt === null
+        ? thread.startedAt
+        : Math.min(thread.startedAt, part.startedAt);
+    thread.updatedAt = thread.updatedAt === null
+      ? part.updatedAt
+      : part.updatedAt === null
+        ? thread.updatedAt
+        : Math.max(thread.updatedAt, part.updatedAt);
     thread.inputTokens += part.inputTokens;
     thread.cachedInputTokens += part.cachedInputTokens;
     thread.outputTokens += part.outputTokens;
@@ -371,9 +535,7 @@ function buildThreadSummaries(): ThreadSummary[] {
     thread.totalTokens += part.totalTokens;
     if (part.partKind === 'reviewer') thread.reviewerTokens += part.totalTokens;
     thread.partCount += 1;
-    for (const model of partModels) {
-      if (!thread.models.includes(model)) thread.models.push(model);
-    }
+    for (const model of partModels) if (!thread.models.includes(model)) thread.models.push(model);
     if (part.estimatedApiCostUsd !== null) {
       thread.estimatedApiCostUsd = (thread.estimatedApiCostUsd ?? 0) + part.estimatedApiCostUsd;
       thread.hasPriced = true;
@@ -393,6 +555,16 @@ function buildThreadSummaries(): ThreadSummary[] {
       : thread.hasUnpriced
         ? 'partial'
         : 'exact-model-match';
+    thread.prompts = promptMap.get(thread.threadId) ?? [];
+
+    const storedMetadata = metadata.get(thread.threadId);
+    if (storedMetadata?.displayName) {
+      thread.title = storedMetadata.displayName;
+      thread.titleSource = 'codex-name';
+    } else if (storedMetadata?.preview) {
+      thread.title = storedMetadata.preview;
+      thread.titleSource = 'codex-preview';
+    }
   }
 
   return [...grouped.values()]
@@ -454,6 +626,26 @@ export function getLocalDailyUsage(days = 7): DailyUsage[] {
   return rows<DailyUsage>(result);
 }
 
+export function getThreadTokenEvents(since: number): Array<{
+  observedAt: number;
+  threadId: string;
+  totalTokens: number;
+  estimatedApiCostUsd: number;
+}> {
+  return rows<{
+    observedAt: number;
+    threadId: string;
+    totalTokens: number;
+    estimatedApiCostUsd: number;
+  }>(db.prepare(`
+    SELECT observed_at AS observedAt, thread_id AS threadId,
+           total_tokens AS totalTokens, COALESCE(estimated_cost_usd, 0) AS estimatedApiCostUsd
+    FROM session_part_token_events
+    WHERE observed_at >= ?
+    ORDER BY observed_at ASC
+  `).all(since));
+}
+
 export function getModelTokenEvents(since: number): Array<{
   observedAt: number;
   model: string;
@@ -480,12 +672,49 @@ export function getModelTokenEvents(since: number): Array<{
 
   return result.map((event) => ({
     observedAt: event.observedAt,
-    model:
-      event.partKind === 'reviewer' || event.model === 'codex-auto-review'
-        ? primaryModels.get(event.threadId) ?? event.model
-        : event.model,
+    model: event.partKind === 'reviewer' || event.model === 'codex-auto-review'
+      ? primaryModels.get(event.threadId) ?? event.model
+      : event.model,
     totalTokens: event.totalTokens,
     estimatedApiCostUsd: event.estimatedApiCostUsd
+  }));
+}
+
+export function getModelUsageSummaries(): ModelUsageSummary[] {
+  const result = rows<{
+    model: string;
+    threads: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+    totalTokens: number;
+    estimatedApiCostUsd: number;
+    pricedEvents: number;
+    eventCount: number;
+  }>(db.prepare(`
+    SELECT model,
+           COUNT(DISTINCT thread_id) AS threads,
+           SUM(input_tokens) AS inputTokens,
+           SUM(cached_input_tokens) AS cachedInputTokens,
+           SUM(output_tokens) AS outputTokens,
+           SUM(reasoning_output_tokens) AS reasoningOutputTokens,
+           SUM(total_tokens) AS totalTokens,
+           COALESCE(SUM(estimated_cost_usd), 0) AS estimatedApiCostUsd,
+           SUM(CASE WHEN estimated_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS pricedEvents,
+           COUNT(*) AS eventCount
+    FROM session_part_token_events
+    GROUP BY model
+    ORDER BY totalTokens DESC
+  `).all());
+
+  return result.map(({ pricedEvents, eventCount, ...row }) => ({
+    ...row,
+    pricingStatus: pricedEvents === 0
+      ? 'unknown'
+      : pricedEvents < eventCount
+        ? 'partial'
+        : 'exact-model-match'
   }));
 }
 
