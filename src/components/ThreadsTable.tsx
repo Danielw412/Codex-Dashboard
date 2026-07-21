@@ -265,11 +265,11 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
               {threads.map((thread) => {
                 const isExpanded = expanded.has(thread.threadId);
                 const primaryUsage =
-                  thread.estimatedFiveHourUsagePercent ?? thread.estimatedSevenDayUsagePercent;
-                const primaryUsageLabel = thread.estimatedFiveHourUsagePercent !== null
-                  ? '5-hour bank at last activity'
-                  : thread.estimatedSevenDayUsagePercent !== null
-                    ? '7-day bank at last activity'
+                  thread.estimatedSevenDayUsagePercent ?? thread.estimatedFiveHourUsagePercent;
+                const primaryUsageLabel = thread.estimatedSevenDayUsagePercent !== null
+                  ? '7-day bank at last activity'
+                  : thread.estimatedFiveHourUsagePercent !== null
+                    ? '5-hour bank at last activity'
                     : 'No reliable before/after samples';
                 return (
                   <Fragment key={thread.threadId}>
@@ -313,7 +313,7 @@ export function ThreadsTable({ threads }: { threads: ThreadSummary[] }) {
                         {thread.estimatedFiveHourUsagePercent !== null &&
                           thread.estimatedSevenDayUsagePercent !== null && (
                             <span className="sub-value">
-                              {formatUsage(thread.estimatedSevenDayUsagePercent)} in 7-day bank
+                              {formatUsage(thread.estimatedFiveHourUsagePercent)} in 5-hour bank
                             </span>
                           )}
                       </td>
